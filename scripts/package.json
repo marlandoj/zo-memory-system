@@ -1,0 +1,10 @@
+{
+  "name": "zo-memory-system",
+  "version": "1.0.0",
+  "description": "SQLite-based memory system for Zo Computer personas",
+  "type": "module",
+  "scripts": {
+    "memory": "bun memory.ts",
+    "demo": "bun demo.ts"
+  }
+}
