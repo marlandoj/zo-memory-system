@@ -158,6 +158,10 @@ zo-agent create \
   --command "bun scripts/memory.ts prune && bun scripts/memory.ts decay"
 ```
 
+## Integration Notes
+
+The swarm orchestrator skill was renamed to 'zo-swarm-orchestrator' and its repo is now https://github.com/marlandoj/zo-swarm-orchestrator.
+
 ## Architecture
 
 ```
