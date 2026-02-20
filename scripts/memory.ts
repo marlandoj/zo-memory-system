@@ -1,36 +1,37 @@
 #!/usr/bin/env bun
 /**
- * Zo Persona Memory Manager
+ * zo-memory-system v2 — Hybrid SQLite + Vector Search
  * 
- * SQLite-based memory system for Zo Computer personas.
- * Uses Bun's built-in sqlite (no native dependencies).
+ * Enhancements from QMD research:
+ * - Vector embeddings (nomic-embed-text via Ollama)
+ * - HyDE query expansion (optional)
+ * - RRF fusion (BM25 + vectors)
+ * - Composite scoring with decay awareness
  * 
- * Usage:
- *   bun memory.ts store --persona shared --entity "user" --key "name" --value "Alice"
- *   bun memory.ts search "daughter birthday"
- *   bun memory.ts lookup --entity "user" --key "preference"
- *   bun memory.ts prune
- *   bun memory.ts stats
+ * Backward compatible with v1 facts DB.
  */
 
 import { Database } from "bun:sqlite";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import { join } from "path";
 
 // --- Configuration ---
 const DB_PATH = process.env.ZO_MEMORY_DB || "/home/workspace/.zo/memory/shared-facts.db";
+const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
+const EMBEDDING_MODEL = process.env.ZO_EMBEDDING_MODEL || "nomic-embed-text";
+const HYDE_MODEL = process.env.ZO_HYDE_MODEL || "qwen2.5:1.5b";
 
 // Decay class TTLs in seconds
 const TTL_DEFAULTS: Record<string, number | null> = {
   permanent: null,
-  stable: 90 * 24 * 3600,   // 90 days
-  active: 14 * 24 * 3600,   // 14 days
-  session: 24 * 3600,       // 24 hours
-  checkpoint: 4 * 3600,     // 4 hours
+  stable: 90 * 24 * 3600,
+  active: 14 * 24 * 3600,
+  session: 24 * 3600,
+  checkpoint: 4 * 3600,
 };
 
 type DecayClass = "permanent" | "stable" | "active" | "session" | "checkpoint";
-type Category = "preference" | "fact" | "decision" | "convention" | "other";
+type Category = "preference" | "fact" | "decision" | "convention" | "other" | "reference" | "project";
 
 interface MemoryEntry {
   id: string;
@@ -47,6 +48,7 @@ interface MemoryEntry {
   expiresAt: number | null;
   lastAccessed: number;
   confidence: number;
+  embedding?: number[];
   metadata?: Record<string, unknown>;
 }
 
@@ -60,50 +62,103 @@ async function initDb(): Promise<Database> {
   db = new Database(DB_PATH);
   db.exec("PRAGMA journal_mode = WAL");
   
-  // Load and execute schema
-  const schemaPath = join(import.meta.dir, "schema.sql");
-  const schema = await Bun.file(schemaPath).text();
-  db.exec(schema);
+  // Ensure v2 schema (add embeddings table)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS fact_embeddings (
+      fact_id TEXT PRIMARY KEY REFERENCES facts(id) ON DELETE CASCADE,
+      embedding BLOB NOT NULL,
+      model TEXT DEFAULT '${EMBEDDING_MODEL}',
+      created_at INTEGER DEFAULT (strftime('%s', 'now'))
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_facts_entity_key ON facts(entity, key);
+    CREATE INDEX IF NOT EXISTS idx_facts_decay ON facts(decay_class, expires_at);
+  `);
   
   dbInitialized = true;
   return db;
 }
 
-// --- Decay Classification ---
-function classifyDecay(entity: string, key: string | null, value: string): DecayClass {
-  const text = `${entity} ${key || ""} ${value}`.toLowerCase();
-  
-  // Permanent: identities, birthdays, decisions with rationale
-  if (/birthday|name|email|decided|chose|always|never/i.test(text)) {
-    return "permanent";
+// --- Embedding Service ---
+async function getEmbedding(text: string): Promise<number[] | null> {
+  try {
+    const response = await fetch(`${OLLAMA_URL}/api/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: EMBEDDING_MODEL,
+        prompt: text.slice(0, 8000), // Truncate if too long
+      }),
+    });
+    
+    if (!response.ok) {
+      console.warn(`Ollama error: ${response.status}`);
+      return null;
+    }
+    
+    const data = await response.json();
+    return data.embedding;
+  } catch (err) {
+    console.warn(`Embedding failed: ${err}`);
+    return null;
   }
-  // Active: current tasks, temporary state
-  if (/currently|working on|sprint|this week|debugging/i.test(text)) {
-    return "active";
-  }
-  // Session: immediate context
-  if (/checkpoint|temp|temporary|right now/i.test(text)) {
-    return "session";
-  }
-  // Default to stable
-  return "stable";
 }
 
-function calculateExpiry(decayClass: DecayClass, fromSec: number): number | null {
-  const ttl = TTL_DEFAULTS[decayClass];
-  return ttl === null ? null : fromSec + ttl;
+async function hydeExpand(query: string): Promise<string[]> {
+  try {
+    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: HYDE_MODEL,
+        prompt: `Given the user query: "${query}"
+
+Generate a hypothetical answer or relevant context that would help find information about this query. 
+Be specific and include likely keywords or facts that would match.
+
+Query: ${query}
+Hypothetical answer/context:`,
+        stream: false,
+      }),
+    });
+    
+    if (!response.ok) return [query];
+    
+    const data = await response.json();
+    const expanded = data.response?.trim();
+    
+    if (expanded && expanded.length > 10) {
+      return [query, expanded];
+    }
+    return [query];
+  } catch {
+    return [query];
+  }
 }
 
-// --- Store Operations ---
-async function store(entry: Omit<MemoryEntry, "id" | "createdAt" | "expiresAt" | "lastAccessed">): Promise<MemoryEntry> {
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+// --- Store with Embedding ---
+async function storeWithEmbedding(entry: Omit<MemoryEntry, "id" | "createdAt" | "expiresAt" | "lastAccessed">): Promise<MemoryEntry | null> {
   const db = await initDb();
   const id = randomUUID();
   const now = Date.now();
   const nowSec = Math.floor(now / 1000);
   
-  const decayClass = entry.decayClass || classifyDecay(entry.entity, entry.key, entry.value);
-  const expiresAt = calculateExpiry(decayClass, nowSec);
+  const decayClass = entry.decayClass || "stable";
+  const expiresAt = TTL_DEFAULTS[decayClass] ? nowSec + TTL_DEFAULTS[decayClass]! : null;
   
+  // Insert fact
   db.prepare(`
     INSERT INTO facts (id, persona, entity, key, value, text, category, decay_class, 
                        importance, source, created_at, expires_at, last_accessed, confidence, metadata)
@@ -126,6 +181,17 @@ async function store(entry: Omit<MemoryEntry, "id" | "createdAt" | "expiresAt" |
     entry.metadata ? JSON.stringify(entry.metadata) : null
   );
   
+  // Generate and store embedding
+  const textToEmbed = entry.text || `${entry.entity} ${entry.key || ""}: ${entry.value}`;
+  const embedding = await getEmbedding(textToEmbed);
+  
+  if (embedding) {
+    db.prepare(`
+      INSERT INTO fact_embeddings (fact_id, embedding, model)
+      VALUES (?, ?, ?)
+    `).run(id, Buffer.from(new Float32Array(embedding).buffer), EMBEDDING_MODEL);
+  }
+  
   return {
     ...entry,
     id,
@@ -135,17 +201,150 @@ async function store(entry: Omit<MemoryEntry, "id" | "createdAt" | "expiresAt" |
   };
 }
 
-// --- Search Operations ---
-async function search(query: string, options: {
-  persona?: string;
-  limit?: number;
-  includeExpired?: boolean;
-} = {}): Promise<Array<{ entry: MemoryEntry; score: number }>> {
+// --- Hybrid Search ---
+async function hybridSearch(
+  query: string,
+  options: { persona?: string; limit?: number; useHyde?: boolean } = {}
+): Promise<Array<{ entry: MemoryEntry; score: number; sources: string[] }>> {
   const db = await initDb();
-  const { persona, limit = 5, includeExpired = false } = options;
+  const { persona, limit = 6, useHyde = true } = options;
   const nowSec = Math.floor(Date.now() / 1000);
   
-  // Build FTS query
+  // Expand query with HyDE if enabled
+  const queryVariants = useHyde ? await hydeExpand(query) : [query];
+  
+  // Get FTS results for all variants
+  const ftsResults = new Map<string, { entry: MemoryEntry; rank: number; source: string }>();
+  
+  for (const qv of queryVariants) {
+    const safeQuery = qv
+      .replace(/['"]/g, "")
+      .split(/\s+/)
+      .filter((w) => w.length > 1)
+      .map((w) => `"${w}"`)
+      .join(" OR ");
+    
+    if (!safeQuery) continue;
+    
+    const rows = db.prepare(`
+      SELECT f.*, rank
+      FROM facts f
+      JOIN facts_fts fts ON f.rowid = fts.rowid
+      WHERE facts_fts MATCH ?
+        AND (f.expires_at IS NULL OR f.expires_at > ?)
+        ${persona ? "AND f.persona = ?" : ""}
+      ORDER BY rank
+      LIMIT ${limit * 2}
+    `).all(...[safeQuery, nowSec, ...(persona ? [persona] : [])]) as Array<Record<string, unknown>>;
+    
+    for (const row of rows) {
+      const id = row.id as string;
+      const existing = ftsResults.get(id);
+      if (!existing || (row.rank as number) < existing.rank) {
+        ftsResults.set(id, {
+          entry: rowToEntry(row),
+          rank: row.rank as number,
+          source: `fts:${qv.slice(0, 30)}`,
+        });
+      }
+    }
+  }
+  
+  // Get vector results
+  const queryEmbedding = await getEmbedding(query);
+  const vectorResults = new Map<string, { entry: MemoryEntry; similarity: number }>();
+  
+  if (queryEmbedding) {
+    // Get all embeddings and compute similarity
+    const embeddings = db.prepare(`
+      SELECT fe.fact_id, fe.embedding
+      FROM fact_embeddings fe
+      JOIN facts f ON fe.fact_id = f.id
+      WHERE (f.expires_at IS NULL OR f.expires_at > ?)
+        ${persona ? "AND f.persona = ?" : ""}
+    `).all(...[nowSec, ...(persona ? [persona] : [])]) as Array<{ fact_id: string; embedding: Buffer }>;
+    
+    for (const row of embeddings) {
+      const embedding = Array.from(new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.length / 4));
+      const similarity = cosineSimilarity(queryEmbedding, embedding);
+      
+      if (similarity > 0.5) { // Threshold
+        const fact = db.prepare("SELECT * FROM facts WHERE id = ?").get(row.fact_id) as Record<string, unknown>;
+        if (fact) {
+          vectorResults.set(row.fact_id, {
+            entry: rowToEntry(fact),
+            similarity,
+          });
+        }
+      }
+    }
+  }
+  
+  // RRF Fusion
+  const scores = new Map<string, { entry: MemoryEntry; ftsRank?: number; vecScore?: number; sources: string[] }>();
+  
+  const k = 60;
+  
+  // Add FTS scores
+  let ftsPos = 1;
+  for (const [id, result] of Array.from(ftsResults.entries()).sort((a, b) => a[1].rank - b[1].rank)) {
+    const existing = scores.get(id);
+    if (existing) {
+      existing.ftsRank = ftsPos;
+      existing.sources.push(result.source);
+    } else {
+      scores.set(id, { entry: result.entry, ftsRank: ftsPos, sources: [result.source] });
+    }
+    ftsPos++;
+  }
+  
+  // Add vector scores
+  let vecPos = 1;
+  for (const [id, result] of Array.from(vectorResults.entries()).sort((a, b) => b[1].similarity - a[1].similarity)) {
+    const existing = scores.get(id);
+    if (existing) {
+      existing.vecScore = vecPos;
+      existing.sources.push("vector");
+    } else {
+      scores.set(id, { entry: result.entry, vecScore: vecPos, sources: ["vector"] });
+    }
+    vecPos++;
+  }
+  
+  // Calculate final scores
+  const finalResults: Array<{ entry: MemoryEntry; score: number; sources: string[] }> = [];
+  
+  for (const [id, result] of scores) {
+    let rrfScore = 0;
+    if (result.ftsRank) rrfScore += 1 / (k + result.ftsRank);
+    if (result.vecScore) rrfScore += 1 / (k + result.vecScore);
+    
+    // Add freshness and confidence
+    const nowSec = Math.floor(Date.now() / 1000);
+    let freshness = 1;
+    if (result.entry.expiresAt) {
+      freshness = Math.max(0, Math.min(1, (result.entry.expiresAt - nowSec) / (14 * 24 * 3600)));
+    }
+    
+    const composite = rrfScore * 0.7 + freshness * 0.2 + result.entry.confidence * 0.1;
+    
+    finalResults.push({
+      entry: result.entry,
+      score: composite,
+      sources: result.sources,
+    });
+  }
+  
+  finalResults.sort((a, b) => b.score - a.score);
+  return finalResults.slice(0, limit);
+}
+
+// --- FTS-only Search (v1 compatible) ---
+async function ftsSearch(query: string, options: { persona?: string; limit?: number } = {}): Promise<Array<{ entry: MemoryEntry; score: number }>> {
+  const db = await initDb();
+  const { persona, limit = 5 } = options;
+  const nowSec = Math.floor(Date.now() / 1000);
+  
   const safeQuery = query
     .replace(/['"]/g, "")
     .split(/\s+/)
@@ -155,86 +354,25 @@ async function search(query: string, options: {
   
   if (!safeQuery) return [];
   
-  // Query with optional persona filter
-  let sql = `
-    SELECT f.*, rank,
-      CASE
-        WHEN f.expires_at IS NULL THEN 1.0
-        WHEN f.expires_at <= ? THEN 0.0
-        ELSE MIN(1.0, CAST(f.expires_at - ? AS REAL) / 604800)
-      END AS freshness
+  const rows = db.prepare(`
+    SELECT f.*, rank
     FROM facts f
     JOIN facts_fts fts ON f.rowid = fts.rowid
     WHERE facts_fts MATCH ?
-      ${includeExpired ? "" : "AND (f.expires_at IS NULL OR f.expires_at > ?)"}
+      AND (f.expires_at IS NULL OR f.expires_at > ?)
       ${persona ? "AND f.persona = ?" : ""}
     ORDER BY rank
     LIMIT ?
-  `;
+  `).all(...[safeQuery, nowSec, ...(persona ? [persona] : []), limit]) as Array<Record<string, unknown>>;
   
-  const params: (string | number)[] = [nowSec, nowSec, safeQuery];
-  if (!includeExpired) params.push(nowSec);
-  if (persona) params.push(persona);
-  params.push(limit * 2);
-  
-  const rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
-  
-  if (rows.length === 0) return [];
-  
-  // Calculate scores and refresh accessed facts
-  const minRank = Math.min(...rows.map((r) => r.rank as number));
-  const maxRank = Math.max(...rows.map((r) => r.rank as number));
+  const minRank = rows.length > 0 ? Math.min(...rows.map((r) => r.rank as number)) : 0;
+  const maxRank = rows.length > 0 ? Math.max(...rows.map((r) => r.rank as number)) : 1;
   const range = maxRank - minRank || 1;
   
-  const results = rows.map((row) => {
-    const bm25Score = 1 - ((row.rank as number) - minRank) / range || 0.8;
-    const freshness = (row.freshness as number) || 1.0;
-    const confidence = (row.confidence as number) || 1.0;
-    const composite = bm25Score * 0.6 + freshness * 0.25 + confidence * 0.15;
-    
-    return {
-      entry: rowToEntry(row),
-      score: composite,
-    };
-  });
-  
-  results.sort((a, b) => b.score - a.score);
-  const topResults = results.slice(0, limit);
-  
-  // Refresh TTL on accessed stable/active facts
-  await refreshAccessed(topResults.map((r) => r.entry.id));
-  
-  return topResults;
-}
-
-async function lookup(entity: string, key?: string, persona?: string): Promise<Array<{ entry: MemoryEntry; score: number }>> {
-  const db = await initDb();
-  const nowSec = Math.floor(Date.now() / 1000);
-  
-  let sql = `SELECT * FROM facts WHERE lower(entity) = lower(?)`;
-  const params: (string | number)[] = [entity];
-  
-  if (key) {
-    sql += ` AND lower(key) = lower(?)`;
-    params.push(key);
-  }
-  
-  if (persona) {
-    sql += ` AND persona = ?`;
-    params.push(persona);
-  }
-  
-  sql += ` AND (expires_at IS NULL OR expires_at > ?) ORDER BY confidence DESC, created_at DESC`;
-  params.push(nowSec);
-  
-  const rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
-  const results = rows.map((row) => ({
+  return rows.map((row) => ({
     entry: rowToEntry(row),
-    score: (row.confidence as number) || 1.0,
+    score: 1 - ((row.rank as number) - minRank) / range || 0.8,
   }));
-  
-  await refreshAccessed(results.map((r) => r.entry.id));
-  return results;
 }
 
 function rowToEntry(row: Record<string, unknown>): MemoryEntry {
@@ -257,203 +395,99 @@ function rowToEntry(row: Record<string, unknown>): MemoryEntry {
   };
 }
 
-async function refreshAccessed(ids: string[]): Promise<void> {
-  if (ids.length === 0) return;
+// --- Backfill Embeddings ---
+async function backfillEmbeddings(batchSize: number = 50): Promise<{ processed: number; failed: number }> {
   const db = await initDb();
-  const nowSec = Math.floor(Date.now() / 1000);
   
-  const stmt = db.prepare(`
-    UPDATE facts
-    SET last_accessed = @now,
-        expires_at = CASE decay_class
-          WHEN 'stable' THEN @now + @stableTtl
-          WHEN 'active' THEN @now + @activeTtl
-          ELSE expires_at
-        END
-    WHERE id = @id
-      AND decay_class IN ('stable', 'active')
-  `);
+  // Find facts without embeddings
+  const facts = db.prepare(`
+    SELECT f.* FROM facts f
+    LEFT JOIN fact_embeddings fe ON f.id = fe.fact_id
+    WHERE fe.fact_id IS NULL
+    LIMIT ?
+  `).all(batchSize) as Array<Record<string, unknown>>;
   
-  db.transaction(() => {
-    for (const id of ids) {
-      stmt.run({
-        now: nowSec,
-        stableTtl: TTL_DEFAULTS.stable,
-        activeTtl: TTL_DEFAULTS.active,
-        id,
-      });
+  let processed = 0;
+  let failed = 0;
+  
+  for (const row of facts) {
+    const text = row.text as string;
+    const embedding = await getEmbedding(text);
+    
+    if (embedding) {
+      db.prepare(`
+        INSERT INTO fact_embeddings (fact_id, embedding, model)
+        VALUES (?, ?, ?)
+      `).run(row.id, Buffer.from(new Float32Array(embedding).buffer), EMBEDDING_MODEL);
+      processed++;
+      process.stdout.write(".");
+    } else {
+      failed++;
+      process.stdout.write("x");
     }
-  })();
-}
-
-// --- Maintenance Operations ---
-async function pruneExpired(): Promise<number> {
-  const db = await initDb();
-  const nowSec = Math.floor(Date.now() / 1000);
-  const result = db.prepare(`DELETE FROM facts WHERE expires_at IS NOT NULL AND expires_at < ?`).run(nowSec);
-  return result.changes;
-}
-
-async function decayConfidence(): Promise<number> {
-  const db = await initDb();
-  const nowSec = Math.floor(Date.now() / 1000);
+  }
   
-  // Decay confidence for facts nearing expiration
-  db.prepare(`
-    UPDATE facts
-    SET confidence = confidence * 0.5
-    WHERE expires_at IS NOT NULL
-      AND expires_at > @now
-      AND last_accessed IS NOT NULL
-      AND (@now - last_accessed) > (expires_at - last_accessed) * 0.75
-      AND confidence > 0.1
-  `).run({ now: nowSec });
-  
-  // Delete low-confidence facts
-  const result = db.prepare(`DELETE FROM facts WHERE confidence < 0.1`).run();
-  return result.changes;
+  console.log();
+  return { processed, failed };
 }
 
-async function stats(): Promise<Record<string, unknown>> {
+// --- Stats ---
+async function stats(): Promise<void> {
   const db = await initDb();
   
   const total = db.prepare(`SELECT COUNT(*) as cnt FROM facts`).get() as { cnt: number };
-  const expired = db.prepare(`SELECT COUNT(*) as cnt FROM facts WHERE expires_at IS NOT NULL AND expires_at < ?`)
-    .get(Math.floor(Date.now() / 1000)) as { cnt: number };
+  const withEmbeddings = db.prepare(`
+    SELECT COUNT(*) as cnt FROM facts f
+    JOIN fact_embeddings fe ON f.id = fe.fact_id
+  `).get() as { cnt: number };
+  const embeddingCount = db.prepare(`SELECT COUNT(*) as cnt FROM fact_embeddings`).get() as { cnt: number };
   
-  const byDecay = db.prepare(`SELECT decay_class, COUNT(*) as cnt FROM facts GROUP BY decay_class`)
-    .all() as Array<{ decay_class: string; cnt: number }>;
-  
-  const byPersona = db.prepare(`SELECT persona, COUNT(*) as cnt FROM facts GROUP BY persona`)
-    .all() as Array<{ persona: string; cnt: number }>;
-  
-  return {
-    total: total.cnt,
-    expired: expired.cnt,
-    byDecay: Object.fromEntries(byDecay.map((r) => [r.decay_class, r.cnt])),
-    byPersona: Object.fromEntries(byPersona.map((r) => [r.persona, r.cnt])),
-  };
-}
-
-// --- Checkpoint Operations ---
-async function saveCheckpoint(context: {
-  intent: string;
-  state: string;
-  expectedOutcome?: string;
-  workingFiles?: string[];
-  persona?: string;
-}): Promise<string> {
-  const data = JSON.stringify({
-    ...context,
-    savedAt: new Date().toISOString(),
-  });
-  
-  const entry = await store({
-    persona: context.persona || "shared",
-    entity: "system",
-    key: `checkpoint:${Date.now()}`,
-    value: context.intent.slice(0, 100),
-    text: data,
-    category: "other",
-    decayClass: "checkpoint",
-    importance: 0.9,
-    source: "checkpoint",
-    confidence: 1.0,
-  });
-  
-  return entry.id;
-}
-
-async function restoreCheckpoint(persona?: string): Promise<{
-  id: string;
-  intent: string;
-  state: string;
-  expectedOutcome?: string;
-  workingFiles?: string[];
-  savedAt: string;
-} | null> {
-  const db = await initDb();
-  const nowSec = Math.floor(Date.now() / 1000);
-  
-  let sql = `
-    SELECT id, value, text FROM facts
-    WHERE entity = 'system' AND key LIKE 'checkpoint:%'
-      AND (expires_at IS NULL OR expires_at > ?)
-  `;
-  const params: (string | number)[] = [nowSec];
-  
-  if (persona) {
-    sql += ` AND persona = ?`;
-    params.push(persona);
-  }
-  
-  sql += ` ORDER BY created_at DESC LIMIT 1`;
-  
-  const row = db.prepare(sql).get(...params) as { id: string; value: string; text: string } | undefined;
-  
-  if (!row) return null;
-  
-  try {
-    return { id: row.id, ...JSON.parse(row.text) };
-  } catch {
-    return null;
-  }
+  console.log("Memory Statistics (v2):");
+  console.log(`  Total facts: ${total.cnt}`);
+  console.log(`  Facts with embeddings: ${withEmbeddings.cnt}`);
+  console.log(`  Vector cache entries: ${embeddingCount.cnt}`);
+  console.log(`  Embedding model: ${EMBEDDING_MODEL}`);
+  console.log(`  Ollama URL: ${OLLAMA_URL}`);
 }
 
 // --- CLI Interface ---
 function printUsage() {
   console.log(`
-Zo Persona Memory Manager
+zo-memory-system v2 — Hybrid SQLite + Vector Search
 
 Usage:
-  bun memory.ts <command> [options]
+  bun memory-next.ts <command> [options]
 
 Commands:
-  store     Store a new fact
-  search    Search facts by text
-  lookup    Lookup facts by entity/key
-  checkpoint  Save or restore checkpoints
-  prune     Remove expired facts
-  decay     Apply confidence decay
+  store     Store a new fact with embedding
+  search    FTS-only search (v1 compatible)
+  hybrid    Hybrid search (FTS + vectors + HyDE)
+  index     Backfill embeddings for existing facts
   stats     Show memory statistics
 
 Store options:
-  --persona <name>     Persona scope (default: shared)
   --entity <name>      Entity name (required)
   --key <name>         Key/attribute (optional)
   --value <text>       Value (required)
   --category <type>    preference|fact|decision|convention|other
   --decay <class>      permanent|stable|active|session|checkpoint
-  --source <text>      Where this came from
-  --text <text>        Full context for search
+  --text <text>        Full context for embedding
 
 Search options:
   --persona <name>     Filter by persona
-  --limit <n>          Max results (default: 5)
-  --expired            Include expired facts
-
-Lookup options:
-  --entity <name>      Entity to lookup (required)
-  --key <name>         Specific key (optional)
-  --persona <name>     Filter by persona
-
-Checkpoint options:
-  save --intent <text> --state <text> [--persona <name>]
-  restore [--persona <name>]
+  --limit <n>          Max results (default: 5/6)
+  --no-hyde            Disable HyDE expansion
 
 Examples:
-  bun memory.ts store --entity "user" --key "name" --value "Alice"
-  bun memory.ts search "project deadline" --limit 10
-  bun memory.ts lookup --entity "user" --key "preference"
-  bun memory.ts checkpoint save --intent "Refactor auth" --state "Starting login.ts"
-  bun memory.ts checkpoint restore
-  bun memory.ts prune
-  bun memory.ts stats
+  bun memory-next.ts store --entity "user" --key "name" --value "Alice"
+  bun memory-next.ts hybrid "router password"
+  bun memory-next.ts hybrid "project deadline" --no-hyde
+  bun memory-next.ts index
+  bun memory-next.ts stats
 `);
 }
 
 async function main() {
-  // Initialize DB on startup
   await initDb();
   
   const args = process.argv.slice(2);
@@ -466,9 +500,17 @@ async function main() {
   
   // Parse flags
   const flags: Record<string, string> = {};
-  for (let i = 1; i < args.length; i += 2) {
+  const positional: string[] = [];
+  for (let i = 1; i < args.length; i++) {
     if (args[i].startsWith("--")) {
-      flags[args[i].slice(2)] = args[i + 1] || "";
+      if (args[i] === "--no-hyde") {
+        flags.hyde = "false";
+      } else {
+        flags[args[i].slice(2)] = args[i + 1] || "";
+        i++;
+      }
+    } else {
+      positional.push(args[i]);
     }
   }
   
@@ -478,7 +520,7 @@ async function main() {
         console.error("Error: --entity and --value are required");
         process.exit(1);
       }
-      const entry = await store({
+      const entry = await storeWithEmbedding({
         persona: flags.persona || "shared",
         entity: flags.entity,
         key: flags.key || null,
@@ -490,94 +532,63 @@ async function main() {
         source: flags.source || "cli",
         confidence: 1.0,
       });
-      console.log(`Stored: ${entry.id} (expires: ${entry.expiresAt ? new Date(entry.expiresAt * 1000).toISOString() : "never"})`);
+      if (entry) {
+        console.log(`Stored: ${entry.id}`);
+        console.log(`Embedding: ${entry.embedding ? "generated" : "failed"}`);
+      }
       break;
     }
     
     case "search": {
-      const query = args.slice(1).find((a) => !a.startsWith("--")) || "";
+      const query = positional[0];
       if (!query) {
         console.error("Error: search query required");
         process.exit(1);
       }
-      const results = await search(query, {
+      const results = await ftsSearch(query, {
         persona: flags.persona,
         limit: parseInt(flags.limit) || 5,
-        includeExpired: flags.expired === "true",
       });
       console.log(`Found ${results.length} results:\n`);
       for (const { entry, score } of results) {
         console.log(`[${entry.decayClass}] ${entry.entity}.${entry.key || "_"} = ${entry.value.slice(0, 80)}`);
-        console.log(`    score: ${score.toFixed(3)} | persona: ${entry.persona} | source: ${entry.source}`);
+        console.log(`    score: ${score.toFixed(3)}`);
         console.log();
       }
       break;
     }
     
-    case "lookup": {
-      if (!flags.entity) {
-        console.error("Error: --entity is required");
+    case "hybrid": {
+      const query = positional[0];
+      if (!query) {
+        console.error("Error: search query required");
         process.exit(1);
       }
-      const results = await lookup(flags.entity, flags.key || undefined, flags.persona);
+      console.log(`Searching: "${query}" ${flags.hyde === "false" ? "(no HyDE)" : "(with HyDE)"}\n`);
+      const results = await hybridSearch(query, {
+        persona: flags.persona,
+        limit: parseInt(flags.limit) || 6,
+        useHyde: flags.hyde !== "false",
+      });
       console.log(`Found ${results.length} results:\n`);
-      for (const { entry } of results) {
-        console.log(`${entry.key || "(no key)"}: ${entry.value}`);
-        console.log(`    decay: ${entry.decayClass} | confidence: ${entry.confidence.toFixed(2)}`);
+      for (const { entry, score, sources } of results) {
+        console.log(`[${entry.decayClass}] ${entry.entity}.${entry.key || "_"} = ${entry.value.slice(0, 80)}`);
+        console.log(`    score: ${score.toFixed(3)} | sources: ${sources.join(", ")}`);
         console.log();
       }
       break;
     }
     
-    case "checkpoint": {
-      const subcmd = args[1];
-      if (subcmd === "save") {
-        if (!flags.intent || !flags.state) {
-          console.error("Error: --intent and --state are required");
-          process.exit(1);
-        }
-        const id = await saveCheckpoint({
-          intent: flags.intent,
-          state: flags.state,
-          expectedOutcome: flags.expected,
-          workingFiles: flags.files ? flags.files.split(",") : undefined,
-          persona: flags.persona,
-        });
-        console.log(`Checkpoint saved: ${id}`);
-      } else if (subcmd === "restore") {
-        const cp = await restoreCheckpoint(flags.persona);
-        if (cp) {
-          console.log("Restored checkpoint:");
-          console.log(JSON.stringify(cp, null, 2));
-        } else {
-          console.log("No checkpoint found");
-        }
-      } else {
-        console.error("Error: checkpoint requires 'save' or 'restore'");
-        process.exit(1);
-      }
-      break;
-    }
-    
-    case "prune": {
-      const count = await pruneExpired();
-      console.log(`Pruned ${count} expired facts`);
-      break;
-    }
-    
-    case "decay": {
-      const count = await decayConfidence();
-      console.log(`Decayed ${count} low-confidence facts`);
+    case "index": {
+      console.log("Backfilling embeddings...");
+      const batch = parseInt(flags.batch) || 50;
+      const { processed, failed } = await backfillEmbeddings(batch);
+      console.log(`\nProcessed: ${processed}, Failed: ${failed}`);
       break;
     }
     
     case "stats": {
-      const s = await stats();
-      console.log("Memory Statistics:");
-      console.log(`  Total facts: ${s.total}`);
-      console.log(`  Expired facts: ${s.expired}`);
-      console.log(`  By decay class:`, s.byDecay);
-      console.log(`  By persona:`, s.byPersona);
+      await stats();
       break;
     }
     

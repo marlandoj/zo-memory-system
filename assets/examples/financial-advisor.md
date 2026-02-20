@@ -1,7 +1,7 @@
 # Financial Advisor Persona Memory
 
 ## User Profile
-- Name: Marlando
+- Name: John Doe
 - Risk tolerance: Conservative
 - Investment timeline: Long-term (10+ years)
 - Primary goals: Wealth preservation, steady growth, tax efficiency
