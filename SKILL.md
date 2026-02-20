@@ -163,5 +163,4 @@ Query → HyDE Expansion (optional) → Embedding
 ## Related Skills
 
 - `zo-swarm-orchestrator` — Multi-agent orchestration with token optimization
-- `ffb-hub` — Fauna & Flora business hub with persona skillpacks
 
