@@ -5,7 +5,7 @@
 set -e
 
 echo "════════════════════════════════════════════════════════════"
-echo "  Zo Memory System - Installation"
+echo "  Zo Memory System v2.1 - Installation"
 echo "════════════════════════════════════════════════════════════"
 echo
 
@@ -13,6 +13,29 @@ SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WORKSPACE_DIR="/home/workspace"
 MEMORY_DIR="$WORKSPACE_DIR/.zo/memory"
 
+# Check for Ollama
+echo "🔍 Checking Ollama..."
+if ! command -v ollama &> /dev/null; then
+  echo "  ⚠️  Ollama not found. Install with: curl -fsSL https://ollama.com/install.sh | sh"
+  echo "  Continuing with FTS-only mode (no vector search)..."
+else
+  # Check for required models
+  echo "  ✓ Ollama found"
+  
+  if ! ollama list | grep -q "nomic-embed-text"; then
+    echo "  ⚠️  nomic-embed-text not found. Pull with: ollama pull nomic-embed-text"
+  else
+    echo "  ✓ nomic-embed-text installed"
+  fi
+  
+  if ! ollama list | grep -q "qwen2.5:1.5b"; then
+    echo "  ⚠️  qwen2.5:1.5b not found (HyDE model). Pull with: ollama pull qwen2.5:1.5b"
+  else
+    echo "  ✓ qwen2.5:1.5b installed"
+  fi
+fi
+
+echo
 echo "📁 Setting up directories..."
 mkdir -p "$MEMORY_DIR"/{personas,checkpoints,scripts}
 
@@ -44,7 +67,7 @@ if [ ! -f "$WORKSPACE_DIR/AGENTS.md" ]; then
 
 ## Memory System Reference
 
-This workspace uses a **SQLite-based memory system** for persona continuity.
+This workspace uses a **hybrid SQLite + Vector memory system** (v2.1) for persona continuity.
 
 ### Quick Commands
 
@@ -53,11 +76,11 @@ This workspace uses a **SQLite-based memory system** for persona continuity.
 bun .zo/memory/scripts/memory.ts store \
   --entity "user" --key "preference" --value "value" --decay permanent
 
-# Search memory
-bun .zo/memory/scripts/memory.ts search "query"
+# Hybrid search (semantic + exact)
+bun .zo/memory/scripts/memory.ts hybrid "query"
 
-# Lookup by entity
-bun .zo/memory/scripts/memory.ts lookup --entity "user"
+# Fast exact search
+bun .zo/memory/scripts/memory.ts search "query" --no-hyde
 
 # View stats
 bun .zo/memory/scripts/memory.ts stats
@@ -96,7 +119,7 @@ echo "════════════════════════�
 echo
 echo "Quick start:"
 echo "  bun .zo/memory/scripts/memory.ts stats"
-echo "  bun .zo/memory/scripts/add-persona.sh \"my-persona\" \"Role\""
+echo "  bun .zo/memory/scripts/memory.ts hybrid \"your query\""
 echo
 echo "Documentation:"
 echo "  file 'Skills/zo-memory-system/SKILL.md'"

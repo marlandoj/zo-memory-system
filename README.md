@@ -1,6 +1,17 @@
-# Zo Memory System Skill
+# Zo Memory System Skill v2.1
 
-Give your Zo Computer personas persistent memory using SQLite.
+Give your Zo Computer personas persistent memory with semantic understanding.
+
+## Prerequisites
+
+```bash
+# Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull required models
+ollama pull nomic-embed-text   # Embeddings (768d)
+ollama pull qwen2.5:1.5b       # HyDE query expansion
+```
 
 ## Installation
 
@@ -25,13 +36,23 @@ bun .zo/memory/scripts/memory.ts store \
   --value "value" \
   --decay permanent
 
-# Search
-bun .zo/memory/scripts/memory.ts search "query"
+# Hybrid search (semantic + exact)
+bun .zo/memory/scripts/memory.ts hybrid "why did we choose SQLite"
+
+# Fast exact search (no vectors)
+bun .zo/memory/scripts/memory.ts search "router password" --no-hyde
 ```
+
+## Performance
+
+| Mode | Latency | Use Case |
+|------|---------|----------|
+| FTS + Vectors | ~0.5s | Specific queries |
+| With HyDE | ~4s | Vague/conceptual queries |
 
 ## Documentation
 
-- `SKILL.md` — Full documentation
+- `SKILL.md` — Full documentation with architecture and configuration
 - `scripts/demo.ts` — Interactive demo
 - `assets/examples/` — Example persona memory files
 
@@ -39,10 +60,10 @@ bun .zo/memory/scripts/memory.ts search "query"
 
 ```
 zo-memory-system/
-├── SKILL.md              # Main documentation
+├── SKILL.md              # Main documentation (v2.1)
 ├── README.md             # This file
 ├── scripts/
-│   ├── memory.ts         # Main CLI
+│   ├── memory.ts         # Main CLI (parallelized v2.1)
 │   ├── add-persona.sh    # Persona setup helper
 │   ├── install.sh        # Install to workspace
 │   ├── schema.sql        # Database schema
@@ -52,13 +73,18 @@ zo-memory-system/
     └── examples/         # Example persona memory files
 ```
 
-## Updating
+## Configuration
 
-To update the skill after changes:
+```bash
+# Environment variables (optional)
+export OLLAMA_URL="http://localhost:11434"
+export ZO_EMBEDDING_MODEL="nomic-embed-text"
+export ZO_HYDE_MODEL="qwen2.5:1.5b"
+```
+
+## Updating
 
 ```bash
 cd /home/workspace/Skills/zo-memory-system
 ./scripts/install.sh
 ```
-
-This will copy the latest scripts to `.zo/memory/`.

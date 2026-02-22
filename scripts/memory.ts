@@ -111,14 +111,12 @@ async function hydeExpand(query: string): Promise<string[]> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: HYDE_MODEL,
-        prompt: `Given the user query: "${query}"
-
-Generate a hypothetical answer or relevant context that would help find information about this query. 
-Be specific and include likely keywords or facts that would match.
-
-Query: ${query}
-Hypothetical answer/context:`,
+        prompt: `Query: "${query}"\n\nHypothetical relevant keywords and context (2-3 sentences):`,
         stream: false,
+        options: {
+          num_predict: 80,
+          temperature: 0.3,
+        }
       }),
     });
     
@@ -207,51 +205,87 @@ async function hybridSearch(
   options: { persona?: string; limit?: number; useHyde?: boolean } = {}
 ): Promise<Array<{ entry: MemoryEntry; score: number; sources: string[] }>> {
   const db = await initDb();
-  const { persona, limit = 6, useHyde = true } = options;
+  const { persona, limit = 10, useHyde = true } = options;
   const nowSec = Math.floor(Date.now() / 1000);
-  
-  // Expand query with HyDE if enabled
-  const queryVariants = useHyde ? await hydeExpand(query) : [query];
-  
-  // Get FTS results for all variants
+
+  // PARALLEL: Run FTS for original query + HyDE + embedding simultaneously
+  const [ftsBaseResults, queryVariants, queryEmbedding] = await Promise.all([
+    // FTS for original query (fast, always needed)
+    (async () => {
+      const safeQuery = query
+        .replace(/['"]/g, "")
+        .split(/\s+/)
+        .filter((w) => w.length > 1)
+        .map((w) => `"${w}"`)
+        .join(" OR ");
+      
+      if (!safeQuery) return [];
+      
+      return db.prepare(`
+        SELECT f.*, rank
+        FROM facts f
+        JOIN facts_fts fts ON f.rowid = fts.rowid
+        WHERE facts_fts MATCH ?
+          AND (f.expires_at IS NULL OR f.expires_at > ?)
+          ${persona ? "AND f.persona = ?" : ""}
+        ORDER BY rank
+        LIMIT ${limit * 2}
+      `).all(...[safeQuery, nowSec, ...(persona ? [persona] : [])]) as Array<Record<string, unknown>>;
+    })(),
+    // HyDE expansion (slow, runs in parallel)
+    useHyde ? hydeExpand(query) : Promise.resolve([query]),
+    // Query embedding (runs in parallel)
+    getEmbedding(query),
+  ]);
+
+  // Collect FTS results
   const ftsResults = new Map<string, { entry: MemoryEntry; rank: number; source: string }>();
   
-  for (const qv of queryVariants) {
-    const safeQuery = qv
+  for (const row of ftsBaseResults) {
+    const id = row.id as string;
+    ftsResults.set(id, {
+      entry: rowToEntry(row),
+      rank: row.rank as number,
+      source: `fts:${query.slice(0, 30)}`,
+    });
+  }
+
+  // If HyDE expanded the query, run FTS for expanded variant (after parallel phase)
+  if (queryVariants.length > 1) {
+    const hydeQuery = queryVariants[1];
+    const safeHydeQuery = hydeQuery
       .replace(/['"]/g, "")
       .split(/\s+/)
       .filter((w) => w.length > 1)
       .map((w) => `"${w}"`)
       .join(" OR ");
     
-    if (!safeQuery) continue;
-    
-    const rows = db.prepare(`
-      SELECT f.*, rank
-      FROM facts f
-      JOIN facts_fts fts ON f.rowid = fts.rowid
-      WHERE facts_fts MATCH ?
-        AND (f.expires_at IS NULL OR f.expires_at > ?)
-        ${persona ? "AND f.persona = ?" : ""}
-      ORDER BY rank
-      LIMIT ${limit * 2}
-    `).all(...[safeQuery, nowSec, ...(persona ? [persona] : [])]) as Array<Record<string, unknown>>;
-    
-    for (const row of rows) {
-      const id = row.id as string;
-      const existing = ftsResults.get(id);
-      if (!existing || (row.rank as number) < existing.rank) {
-        ftsResults.set(id, {
-          entry: rowToEntry(row),
-          rank: row.rank as number,
-          source: `fts:${qv.slice(0, 30)}`,
-        });
+    if (safeHydeQuery) {
+      const hydeRows = db.prepare(`
+        SELECT f.*, rank
+        FROM facts f
+        JOIN facts_fts fts ON f.rowid = fts.rowid
+        WHERE facts_fts MATCH ?
+          AND (f.expires_at IS NULL OR f.expires_at > ?)
+          ${persona ? "AND f.persona = ?" : ""}
+        ORDER BY rank
+        LIMIT ${limit}
+      `).all(...[safeHydeQuery, nowSec, ...(persona ? [persona] : [])]) as Array<Record<string, unknown>>;
+      
+      for (const row of hydeRows) {
+        const id = row.id as string;
+        if (!ftsResults.has(id)) {
+          ftsResults.set(id, {
+            entry: rowToEntry(row),
+            rank: row.rank as number,
+            source: `fts:hyde`,
+          });
+        }
       }
     }
   }
   
   // Get vector results
-  const queryEmbedding = await getEmbedding(query);
   const vectorResults = new Map<string, { entry: MemoryEntry; similarity: number }>();
   
   if (queryEmbedding) {
