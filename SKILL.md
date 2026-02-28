@@ -5,13 +5,13 @@ compatibility: Created for Zo Computer. Requires Bun and Ollama.
 metadata:
   author: marlandoj.zo.computer
   updated: 2026-02-22
-  version: 2.1.0
+  version: 2.2.0
 ---
-# Zo Memory System Skill v2.1.0
+# Zo Memory System Skill v2.2.0
 
 Give your Zo personas persistent memory with semantic understanding.
 
-**v2.1 Updates:** Optimized HyDE with parallelized execution, qwen2.5:1.5b model, ~4s hybrid search
+**v2.2 Updates:** Ollama health checks, fetch timeouts, prune/decay/consolidate/link/graph commands, vector pre-filtering, adaptive decay, associative routing
 
 ---
 
@@ -20,11 +20,15 @@ Give your Zo personas persistent memory with semantic understanding.
 - **Hybrid search** — BM25 (FTS5) + vector similarity with RRF fusion
 - **Semantic understanding** — Finds facts even with paraphrased queries
 - **HyDE expansion** — qwen2.5:1.5b query rewriting for vague searches (parallelized)
-- **5-tier decay system** — Automatic pruning from session (24h) to permanent (never)
+- **5-tier adaptive decay** — Automatic promotion/demotion based on access patterns
 - **Local embeddings** — nomic-embed-text (768d) via Ollama (no API costs)
 - **Per-persona memory files** — Critical facts always loaded with the persona
 - **Shared memory database** — Cross-persona facts with vector index
+- **Associative routing** — Graph links between related facts (link/graph commands)
+- **Memory consolidation** — Automatic deduplication and merging of related facts
 - **Swarm integration** — Token-optimized memory for multi-agent workflows
+- **Health checks** — Ollama connectivity and model validation at startup
+- **Fetch timeouts** — 15s timeout on all Ollama calls (prevents indefinite hangs)
 - **Scheduled maintenance** — Hourly prune/decay automation
 - **Checkpoint system** — Save/restore task state
 - **Graceful fallback** — Works without Ollama (FTS5 only)
@@ -127,14 +131,30 @@ bun scripts/memory.ts lookup --entity "user" --key "name"
 # View statistics (shows embeddings count, model config)
 bun scripts/memory.ts stats
 
+# Check Ollama health and model availability
+bun scripts/memory.ts health
+
 # Backfill embeddings for all facts
 bun scripts/memory.ts index
 
-# Prune expired facts
+# Prune expired facts and orphaned embeddings
 bun scripts/memory.ts prune
 
-# Apply confidence decay
+# Apply adaptive decay (demotes stale, promotes frequently-accessed)
 bun scripts/memory.ts decay
+
+# Consolidate duplicate facts (merge same entity+key entries)
+bun scripts/memory.ts consolidate
+```
+
+### Associative Routing (Graph Links)
+```bash
+# Link two related facts
+bun scripts/memory.ts link --source <id1> --target <id2> --relation "related"
+
+# View links for a fact or entity
+bun scripts/memory.ts graph --entity "user"
+bun scripts/memory.ts graph --id <fact-id>
 ```
 
 ---
@@ -147,6 +167,7 @@ bun scripts/memory.ts decay
 │   ├── facts                # Core facts table
 │   ├── facts_fts            # FTS5 virtual table
 │   ├── fact_embeddings      # Vector embeddings (768d)
+│   ├── fact_links           # Associative routing graph
 │   └── embedding_cache      # Content hash cache
 ├── personas/
 │   ├── [persona-1].md       # Critical facts per persona
@@ -194,6 +215,7 @@ export ZO_MEMORY_DB="/path/to/shared-facts.db"  # Default: .zo/memory/
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.2.0 | 2026-02-27 | Ollama health check, fetch timeouts, prune/decay/consolidate/link/graph commands, vector pre-filtering, adaptive decay, associative routing, PRAGMA busy_timeout |
 | 2.1.0 | 2026-02-22 | Parallelized HyDE/FTS/embedding execution, optimized for qwen2.5:1.5b, performance docs |
 | 2.0.0 | 2026-02-19 | Hybrid SQLite + Vector search, HyDE query expansion, semantic retrieval, nomic-embed-text via Ollama |
 | 1.1.0 | 2026-02-18 | Added swarm v4 integration documentation |
