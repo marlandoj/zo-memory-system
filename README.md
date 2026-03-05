@@ -1,4 +1,4 @@
-# Zo Memory System Skill v2.3
+# Zo Memory System Skill v3.0.0
 
 Give your Zo Computer personas persistent memory with semantic understanding and an Ollama-powered memory gate for always-on context injection.
 
