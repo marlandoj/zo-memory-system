@@ -5,9 +5,9 @@ compatibility: Created for Zo Computer. Requires Bun and Ollama.
 metadata:
   author: marlandoj.zo.computer
   updated: 2026-03-07
-  version: 3.2.0
+  version: 3.3.1
 ---
-# Zo Memory System Skill v3.2.0
+# Zo Memory System Skill v3.3.1
 
 Give your Zo personas persistent memory with semantic understanding, graph intelligence, and automatic fact capture.
 
@@ -35,6 +35,8 @@ Give your Zo personas persistent memory with semantic understanding, graph intel
 - **BFS path finding** — Find shortest connection between any two entities
 - **Knowledge gap analysis** — Identify orphan facts, dead ends, weak links, and clusters
 - **Auto-capture** — Extract facts from conversation transcripts automatically
+- **Conversation capture** — Scan all workspace artifacts and extract facts from every conversation (not just swarm)
+- **Scheduled capture agent** — Daily agent that runs conversation-capture and emails a maintenance report
 - **Contradiction detection** — New facts that conflict with existing ones create supersession links
 - **5-tier adaptive decay** — Automatic promotion/demotion based on access patterns
 - **Local embeddings** — nomic-embed-text (768d) via Ollama (no API costs)
@@ -321,6 +323,50 @@ Facts extracted from the same conversation are automatically linked with `relati
 
 ---
 
+## Conversation Capture (conversation-capture.ts)
+
+Extends memory capture beyond swarm tasks to **all conversations**. Scans workspace artifact directories (`/home/.z/workspaces/con_*/`) for reports, analysis outputs, and tool results, then runs them through the auto-capture extraction pipeline.
+
+```bash
+# List all capturable artifacts
+bun scripts/conversation-capture.ts --list
+
+# Process all new artifacts
+bun scripts/conversation-capture.ts
+
+# Only last 24 hours
+bun scripts/conversation-capture.ts --since 24h
+
+# Preview without storing
+bun scripts/conversation-capture.ts --dry-run
+
+# Show capture statistics
+bun scripts/conversation-capture.ts --stats
+```
+
+### Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--since <duration>` | Filter by recency: 1h, 24h, 7d, 30d, 1w, 1m | all |
+| `--dry-run` | Show extraction without storing | false |
+| `--list` | List capturable files with status | — |
+| `--stats` | Show conversation capture statistics | — |
+
+### Filters
+
+- Skips files < 200 bytes or > 500 KB
+- Skips `read_webpage/`, `browser_agent/`, `node_modules/`, `venv/` directories
+- Only processes `.md`, `.txt`, `.json` files
+- Hash-based dedup via `capture_log` table (never re-processes same content)
+- Creates episodes for each capture session
+
+### Scheduled Agent
+
+A daily agent runs at 04:00 AM Phoenix time, executing conversation-capture for the last 24 hours and emailing a maintenance report with fact counts, DB stats, and any errors.
+
+---
+
 ## Episodic Memory (v3.1)
 
 Episodic memory captures "what happened" as events with outcomes — complementing facts (what is true) with episodes (what occurred).
@@ -441,18 +487,46 @@ The swarm orchestrator (`orchestrate-v4.ts`) now:
 
 ---
 
-## MCP Server (v3.2)
+## MCP Server (v3.3.1)
 
-Expose the memory system as MCP tools for Claude Desktop, Cursor, and other MCP-compatible clients.
+Expose the memory system as MCP tools for Claude Desktop, Cursor, Gemini, Codex, and other MCP-compatible clients.
 
-### Starting the Server
+### Transport Modes
+
+| Mode | Script | Use Case |
+|------|--------|----------|
+| **HTTP (Streamable HTTP)** | `mcp-server-http.ts` | Network access — hosted service, multi-agent, all personas |
+| **Stdio** | `mcp-server.ts` | Direct process spawn — Claude Desktop, single-client |
+
+### HTTP Server (Recommended)
+
+The HTTP MCP server runs as a Zo hosted service with auto-restart and HTTPS.
+
+```bash
+# Start locally (for testing)
+PORT=48400 bun scripts/mcp-server-http.ts
+
+# Health check
+curl http://localhost:48400/health
+
+# MCP endpoint
+POST http://localhost:48400/mcp
+```
+
+**Hosted service:** `https://zo-memory-mcp-marlandoj.zocomputer.io`
+- Service ID: `svc_PXkgBzRdH8M`
+- Local port: 48400
+- Health: `/health`
+- MCP: `/mcp` (Streamable HTTP transport)
+
+**Optional auth:** Set `ZO_MEMORY_MCP_TOKEN` env var to require Bearer token auth.
+
+### Stdio Server
 
 ```bash
 bun scripts/mcp-server.ts          # Direct
 bun scripts/memory.ts mcp          # Via CLI
 ```
-
-The server uses stdio transport and binds to localhost only.
 
 ### Available Tools
 
@@ -464,10 +538,21 @@ The server uses stdio transport and binds to localhost only.
 | `memory_procedures` | List or show workflow procedures |
 | `cognitive_profile` | Show executor cognitive profile (history, patterns, affinities) |
 
-### Claude Desktop Configuration
+### Client Configuration
 
-Add to `~/.claude.json` or `claude_desktop_config.json`:
+**Claude Code** (`~/.claude.json` or project `.mcp.json`):
+```json
+{
+  "mcpServers": {
+    "zo-memory": {
+      "type": "http",
+      "url": "http://localhost:48400/mcp"
+    }
+  }
+}
+```
 
+**Claude Desktop** (stdio mode, `claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
@@ -478,6 +563,28 @@ Add to `~/.claude.json` or `claude_desktop_config.json`:
   }
 }
 ```
+
+**Gemini** (`~/.gemini/settings.json`):
+```json
+{
+  "mcpServers": {
+    "zo-memory": {
+      "url": "http://localhost:48400/mcp",
+      "type": "http",
+      "trust": true
+    }
+  }
+}
+```
+
+**Codex** (`~/.codex/config.toml`):
+```toml
+[mcp_servers.zo-memory]
+url = "http://localhost:48400/mcp"
+startup_timeout_sec = 10
+```
+
+**Swarm bridge:** The Claude Code bridge script (`claude-code-bridge.sh`) pre-approves all `mcp__zo-memory__*` tools via `--allowedTools`.
 
 ---
 
@@ -609,6 +716,7 @@ The gate is what makes this memory system viable for swarm workflows. Without ga
     ├── graph.ts             # Knowledge graph CLI (v3.0)
     ├── graph-boost.ts       # Graph scoring module (v3.0)
     ├── auto-capture.ts      # Conversation-to-fact extraction + episode hook (v3.1)
+    ├── conversation-capture.ts  # Workspace artifact scanner for all conversations (v3.3)
     ├── migrate-v2.sql       # Schema migration for episodic/procedural memory (v3.1)
     ├── rollback-v2.sql      # Migration rollback script (v3.1)
     ├── add-persona.sh       # Persona setup helper
@@ -669,6 +777,8 @@ bun scripts/test-capture.ts
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.3.1 | 2026-03-07 | HTTP MCP server (`mcp-server-http.ts`) — Streamable HTTP transport via Bun.serve(), registered as Zo hosted service (`svc_PXkgBzRdH8M`), HTTPS at `zo-memory-mcp-marlandoj.zocomputer.io`, configured in Claude Code / Gemini / Codex / workspace .mcp.json, bridge script updated with zo-memory tool permissions |
+| 3.3.0 | 2026-03-07 | Conversation capture (conversation-capture.ts) — scan all workspace artifacts for fact extraction, not just swarm. Scheduled daily agent for automatic capture + maintenance reports. Memory Manager persona with full CLI access. |
 | 3.2.0 | 2026-03-07 | Procedural memory (versioned workflow storage, CRUD, feedback, Ollama evolution), cognitive profiles (episode IDs, failure patterns, entity affinities in executor-history.json), orchestrator v4.5 integration (auto-episode on swarm completion, 6-signal composite routing with procedure + temporal scores), MCP server (5 tools: search, store, episodes, procedures, cognitive_profile), import pipeline (ChatGPT, Obsidian, markdown), enhanced CLI (profile, import, mcp commands) |
 | 3.1.0 | 2026-03-07 | Episodic memory (episodes table, entity tagging, temporal queries), velocity trends, DB migration system (migrate/rollback), auto-capture episode hook, stats v3 with episode/procedure counts |
 | 3.0.0 | 2026-03-04 | Graph-boosted hybrid search (graph-boost.ts), BFS path finding & knowledge gap analysis (graph.ts), auto-capture pipeline (auto-capture.ts), co-capture linking, contradiction detection, scoring redistribution (RRF 0.60 + Graph 0.15 + Freshness 0.15 + Confidence 0.10) |
