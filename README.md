@@ -1,8 +1,10 @@
-# Zo Memory System
+# Zouroboros Memory System
 
 > Give your Zo Computer personas persistent memory with semantic understanding, a knowledge graph, and automatic fact extraction. All local, no API costs.
+>
+> Part of the [Zouroboros](https://github.com/marlandoj) ecosystem — self-improving AI development tools for Zo Computer.
 
-[![Version](https://img.shields.io/badge/version-3.2.0-blue?style=flat-square)](https://github.com/marlandoj/zo-memory-system)
+[![Version](https://img.shields.io/badge/version-3.2.0-blue?style=flat-square)](https://github.com/marlandoj/zouroboros-memory-system)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
@@ -23,7 +25,7 @@ This skill gives your AI personas long-term memory that persists across conversa
 - **Import Pipeline** -- Import facts from ChatGPT exports, Obsidian vaults, and markdown files with dedup and auto-embedding
 - **Memory Gate** -- A local model that decides whether each message needs stored memory, filtering 40-60% of messages and saving tokens
 - **5-Tier Adaptive Decay** -- Facts automatically promote or demote based on how often they're accessed
-- **Swarm Integration** -- Token-optimized memory for multi-agent workflows via [zo-swarm-orchestrator](https://github.com/marlandoj/zo-swarm-orchestrator), with 6-signal composite routing, auto-episode creation, and cognitive profiles
+- **Swarm Integration** -- Token-optimized memory for multi-agent workflows via [zouroboros-swarm-orchestrator](https://github.com/marlandoj/zouroboros-swarm-orchestrator), with 6-signal composite routing, auto-episode creation, and cognitive profiles
 - **Fully Local** -- Embeddings and query expansion run on Ollama (nomic-embed-text + qwen2.5:1.5b). No external API costs
 
 ---
@@ -355,7 +357,7 @@ and store them in memory under the "ffb-project" persona.
 ## Repository Structure
 
 ```
-zo-memory-system/
+zouroboros-memory-system/
 ├── SKILL.md                  # Full documentation (v3.2)
 ├── README.md                 # This file
 ├── scripts/
@@ -395,9 +397,9 @@ export ZO_MEMORY_DB="/path/to/shared-facts.db"
 
 ## Related Skills
 
-- [zo-persona-creator](https://github.com/marlandoj/zo-persona-creator) -- Create personas that use this memory system
-- [zo-swarm-orchestrator](https://github.com/marlandoj/zo-swarm-orchestrator) -- Multi-agent coordination with token-optimized memory
-- [zo-swarm-executors](https://github.com/marlandoj/zo-swarm-executors) -- Local executor bridges that share memory
+- [zouroboros-persona-creator](https://github.com/marlandoj/zouroboros-persona-creator) -- Create personas that use this memory system
+- [zouroboros-swarm-orchestrator](https://github.com/marlandoj/zouroboros-swarm-orchestrator) -- Multi-agent coordination with token-optimized memory
+- [zouroboros-swarm-executors](https://github.com/marlandoj/zouroboros-swarm-executors) -- Local executor bridges that share memory
 
 ---
 
