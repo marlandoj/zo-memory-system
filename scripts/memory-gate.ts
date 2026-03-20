@@ -15,6 +15,7 @@
  */
 
 import { detectContinuation } from "./continuation";
+import { extractWikilinks } from "./wikilink-utils";
 
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const GATE_MODEL = process.env.ZO_GATE_MODEL || "qwen2.5:1.5b";
@@ -152,6 +153,18 @@ async function main() {
       const continuationResults = await searchContinuation(message);
       if (continuationResults && !continuationResults.includes("No continuation context found")) {
         console.log(continuationResults);
+        process.exit(0);
+      }
+    }
+
+    // Wikilink fast-path: if message contains [[entity]], search directly without Ollama
+    const wikilinks = extractWikilinks(message);
+    if (wikilinks.length > 0) {
+      const wlKeywords = wikilinks.map(wl => wl.entity);
+      const results = await searchMemory(wlKeywords, true);
+      if (results && !results.includes("No results") && !results.includes("Found 0 results") && results.length >= 10) {
+        console.log(`[Memory Context — wikilink fast-path: ${wlKeywords.join(", ")}]`);
+        console.log(results);
         process.exit(0);
       }
     }
