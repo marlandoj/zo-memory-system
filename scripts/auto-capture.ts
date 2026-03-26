@@ -23,6 +23,7 @@ import {
   resolveMatchingOpenLoops,
   upsertOpenLoop,
 } from "./continuation";
+import { extractWikilinks, resolveWikilinkTargets, autoCorrectWikilinks, shouldExcludeFromWrapping, ENTITY_LIKE_PATTERN } from "./wikilink-utils";
 import { extractWikilinks, resolveWikilinkTargets } from "./wikilink-utils";
 
 // --- Configuration ---
@@ -234,6 +235,52 @@ function checkExisting(db: Database, entity: string, key: string, value: string)
   return { isDuplicate: false, contradicts: existing[0].id };
 }
 
+// --- Wikilink Validation Post-Pass ---
+
+function validateWikilinks(facts: CapturedFact[], db: Database): CapturedFact[] {
+  // Build entity set from the batch for cross-fact detection
+  const batchEntities = new Set(facts.map(f => f.entity.toLowerCase()));
+
+  return facts.map(fact => {
+    let value = fact.value;
+
+    // 1. Auto-correct using shared wikilink-utils (checks DB for known entities)
+    const correction = autoCorrectWikilinks(value, db, fact.entity);
+    if (correction) {
+      value = correction.corrected_value;
+    }
+
+    // 2. Cross-fact entity detection: if entity of fact A appears bare in fact B's value, wrap it
+    ENTITY_LIKE_PATTERN.lastIndex = 0;
+    const existingLinks = extractWikilinks(value);
+    const linkedSet = new Set(existingLinks.map(w => w.entity.toLowerCase()));
+
+    for (const otherEntity of batchEntities) {
+      if (otherEntity === fact.entity.toLowerCase()) continue;
+      if (linkedSet.has(otherEntity)) continue;
+      if (shouldExcludeFromWrapping(otherEntity)) continue;
+
+      // Check if this entity appears as a bare word in the value
+      const bareRe = new RegExp(`\\b${otherEntity.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
+      if (bareRe.test(value)) {
+        // Make sure it's not already inside [[ ]]
+        value = value.replace(bareRe, (match, offset) => {
+          const before = value.slice(0, offset);
+          const openBrackets = (before.match(/\[\[/g) || []).length;
+          const closeBrackets = (before.match(/\]\]/g) || []).length;
+          if (openBrackets > closeBrackets) return match; // inside wikilink
+          return `[[${match}]]`;
+        });
+      }
+    }
+
+    if (value !== fact.value) {
+      return { ...fact, value };
+    }
+    return fact;
+  });
+}
+
 // --- Core Pipeline ---
 
 async function runCapture(
@@ -276,6 +323,9 @@ async function runCapture(
       heuristicOnly = true;
     }
   }
+
+  // Wikilink validation post-pass: wrap bare entities in extracted facts before store
+  candidates = validateWikilinks(candidates, db);
 
   const stored: CapturedFact[] = [];
   const skipped: Array<{ fact: CapturedFact; reason: string }> = [];

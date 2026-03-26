@@ -20,6 +20,135 @@ export interface ResolvedWikilink extends ParsedWikilink {
   isStub: boolean;
 }
 
+// --- Exclusion Filter ---
+// Entity-like pattern: category.subject format (e.g., project.ffb, system.memory)
+export const ENTITY_LIKE_PATTERN = /\b([a-z][a-z0-9_-]+\.(?:[a-z][a-z0-9_-]+))\b/g;
+
+// File extensions to exclude from wikilink wrapping
+const EXCLUDED_EXTENSIONS = new Set([
+  ".ts", ".js", ".json", ".yaml", ".yml", ".py", ".sh", ".css", ".html",
+  ".sql", ".toml", ".lock", ".env", ".log", ".csv", ".txt", ".md",
+  ".tsx", ".jsx", ".mjs", ".cjs", ".xml", ".svg", ".png", ".jpg",
+]);
+
+// URL TLDs to exclude
+const URL_TLDS = [".com", ".org", ".net", ".io", ".dev", ".app", ".co", ".ai"];
+
+// Version string pattern: v1.0, v2.3.1, etc.
+const VERSION_RE = /^v\d+\.\d+/i;
+
+// Common abbreviations with periods
+const ABBREVIATIONS = new Set(["e.g", "i.e", "etc.", "vs.", "a.m", "p.m", "u.s", "no."]);
+
+export function shouldExcludeFromWrapping(candidate: string): boolean {
+  const lower = candidate.toLowerCase();
+
+  // File extension check
+  const dotIdx = lower.lastIndexOf(".");
+  if (dotIdx >= 0) {
+    const ext = lower.slice(dotIdx);
+    if (EXCLUDED_EXTENSIONS.has(ext)) return true;
+  }
+
+  // URL TLD check
+  for (const tld of URL_TLDS) {
+    if (lower.includes(tld)) return true;
+  }
+
+  // Version string check
+  if (VERSION_RE.test(candidate)) return true;
+
+  // Abbreviation check
+  if (ABBREVIATIONS.has(lower)) return true;
+
+  // Numeric-heavy: more digits than letters (likely a version or ID)
+  const digits = (candidate.match(/\d/g) || []).length;
+  const letters = (candidate.match(/[a-z]/gi) || []).length;
+  if (digits > letters && digits > 2) return true;
+
+  return false;
+}
+
+// --- Auto-Correction ---
+export interface WikilinkAutoCorrection {
+  original_value: string;
+  corrected_value: string;
+  corrections_made: Array<{ entity: string; position: number }>;
+  confidence_tier: "known" | "pattern";
+}
+
+export function autoCorrectWikilinks(
+  value: string,
+  db?: Database | null,
+  selfEntity?: string
+): WikilinkAutoCorrection | null {
+  // Find existing wikilinks to avoid double-wrapping
+  const existingWikilinks = extractWikilinks(value);
+  const wikilinkedEntities = new Set(existingWikilinks.map(w => w.entity.toLowerCase()));
+
+  // Build set of known entities from DB for high-confidence tier
+  const knownEntities = new Set<string>();
+  if (db) {
+    try {
+      const rows = db.prepare(
+        "SELECT DISTINCT entity FROM facts WHERE value != '' AND key != 'stub' LIMIT 5000"
+      ).all() as Array<{ entity: string }>;
+      for (const row of rows) knownEntities.add(row.entity.toLowerCase());
+    } catch { /* DB may not be available */ }
+  }
+
+  const corrections: Array<{ entity: string; position: number; tier: "known" | "pattern" }> = [];
+
+  ENTITY_LIKE_PATTERN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ENTITY_LIKE_PATTERN.exec(value)) !== null) {
+    const candidate = match[1];
+    const lower = candidate.toLowerCase();
+
+    // Skip self-references
+    if (selfEntity && lower === selfEntity.toLowerCase()) continue;
+
+    // Skip already-wikilinked
+    if (wikilinkedEntities.has(lower)) continue;
+
+    // Skip excluded patterns
+    if (shouldExcludeFromWrapping(candidate)) continue;
+
+    // Check if inside existing [[...]] brackets
+    const before = value.slice(0, match.index);
+    const openBrackets = (before.match(/\[\[/g) || []).length;
+    const closeBrackets = (before.match(/\]\]/g) || []).length;
+    if (openBrackets > closeBrackets) continue; // inside wikilink already
+
+    // Determine confidence tier
+    if (knownEntities.has(lower)) {
+      corrections.push({ entity: candidate, position: match.index, tier: "known" });
+    } else {
+      // Pattern tier: only wrap if it matches canonical category.subject format
+      // Already guaranteed by ENTITY_LIKE_PATTERN regex
+      corrections.push({ entity: candidate, position: match.index, tier: "pattern" });
+    }
+  }
+
+  if (corrections.length === 0) return null;
+
+  // Apply corrections in reverse order to preserve positions
+  let corrected = value;
+  for (const corr of corrections.sort((a, b) => b.position - a.position)) {
+    corrected =
+      corrected.slice(0, corr.position) +
+      `[[${corr.entity}]]` +
+      corrected.slice(corr.position + corr.entity.length);
+  }
+
+  return {
+    original_value: value,
+    corrected_value: corrected,
+    corrections_made: corrections.map(c => ({ entity: c.entity, position: c.position })),
+    confidence_tier: corrections.some(c => c.tier === "known") ? "known" : "pattern",
+  };
+}
+
 const WIKILINK_RE = /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g;
 
 export function extractWikilinks(text: string): ParsedWikilink[] {

@@ -97,6 +97,7 @@ function getDb(): Database {
       contradictions INTEGER,
       model TEXT,
       duration_ms INTEGER,
+      capture_mode TEXT DEFAULT 'batch',
       created_at INTEGER DEFAULT (strftime('%s', 'now'))
     );
     CREATE TABLE IF NOT EXISTS fact_links (
@@ -116,11 +117,22 @@ function getDb(): Database {
       created_at INTEGER DEFAULT (strftime('%s', 'now'))
     );
   `);
+  // Safe migration: only run if capture_mode column doesn't exist yet
+  const colCheck = db.prepare("PRAGMA table_info(capture_log)").all() as any[];
+  const hasCaptureMode = colCheck.some((c: any) => c.name === "capture_mode");
+  if (!hasCaptureMode) {
+    db.exec("ALTER TABLE capture_log ADD COLUMN capture_mode TEXT DEFAULT 'batch'");
+  }
   ensureContinuationSchema(db);
   return db;
 }
 
-function isAlreadyCaptured(db: Database, hash: string): boolean {
+function isAlreadyCaptured(db: Database, hash: string, captureMode: string = "batch"): boolean {
+  // Batch path: skip only if already batch-captured. Inline-captured content
+  // is allowed to pass through (different capture surface — raw text vs. artifacts).
+  if (captureMode === "batch") {
+    return !!db.prepare("SELECT id FROM capture_log WHERE transcript_hash = ? AND capture_mode = 'batch'").get(hash);
+  }
   return !!db.prepare("SELECT id FROM capture_log WHERE transcript_hash = ?").get(hash);
 }
 
@@ -443,8 +455,8 @@ async function processArtifacts(artifacts: ArtifactFile[], dryRun: boolean): Pro
           upsertOpenLoop(db, loop);
           totalOpenLoopsStored++;
         }
-        db.prepare(`INSERT INTO capture_log (id, source, transcript_hash, facts_extracted, facts_skipped, contradictions, model, duration_ms)
-          VALUES (?, ?, ?, 0, 0, 0, ?, ?)`).run(randomUUID(), source, hash, model, 0);
+        db.prepare(`INSERT INTO capture_log (id, source, transcript_hash, facts_extracted, facts_skipped, contradictions, model, capture_mode, duration_ms)
+          VALUES (?, ?, ?, 0, 0, 0, ?, 'batch', ?)`).run(randomUUID(), source, hash, model, 0);
       }
       filesProcessed++;
       continue;
@@ -470,8 +482,8 @@ async function processArtifacts(artifacts: ArtifactFile[], dryRun: boolean): Pro
     }
 
     if (!dryRun) {
-      db.prepare(`INSERT INTO capture_log (id, source, transcript_hash, facts_extracted, facts_skipped, contradictions, model, duration_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(randomUUID(), source, hash, result.stored, result.skipped, result.contradictions, model, 0);
+      db.prepare(`INSERT INTO capture_log (id, source, transcript_hash, facts_extracted, facts_skipped, contradictions, model, capture_mode, duration_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'batch', ?)`).run(randomUUID(), source, hash, result.stored, result.skipped, result.contradictions, model, 0);
     }
 
     console.log(`  -> ${result.stored} stored, ${result.skipped} skipped, ${result.contradictions} contradictions`);
