@@ -15,6 +15,7 @@
  */
 
 import { detectContinuation } from "./continuation";
+import { extractWikilinks } from "./wikilink-utils";
 
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const GATE_MODEL = process.env.ZO_GATE_MODEL || "qwen2.5:1.5b";
@@ -137,6 +138,66 @@ async function searchContinuation(message: string): Promise<string> {
   return stdout.trim();
 }
 
+// --- Exported module API (for inline import, no subprocess overhead) ---
+
+export interface GateDecision {
+  inject: boolean;
+  method: string;
+  latency_ms: number;
+}
+
+const KEYWORD_MEMORY_PATTERNS = [
+  /\b(update|check|status|progress|continue|resume|review|where did we|left off|last time)\b/i,
+  /\b(project|system|config|persona|swarm|memory|episode|procedure)\./i,
+  /\b(what happened|how is|show me|find)\b.*\b(with|about|for|in)\b/i,
+];
+
+const KEYWORD_SKIP_PATTERNS = [
+  /^(hi|hello|hey|thanks|thank you|ok|sure|yes|no|bye|goodbye)\s*[!?.]*$/i,
+  /^(what is|define|explain|how to|how do you)\s/i,
+  /^\d+\s*[\+\-\*\/]\s*\d+/,
+];
+
+export async function shouldInjectMemory(taskText: string): Promise<GateDecision> {
+  const start = Date.now();
+
+  // Tier 1: Wikilink fast-path (<1ms)
+  const wikilinks = extractWikilinks(taskText);
+  if (wikilinks.length > 0) {
+    return { inject: true, method: "wikilink_fast_path", latency_ms: Date.now() - start };
+  }
+
+  // Tier 2: Keyword heuristic (<5ms)
+  const hasMemoryKeyword = KEYWORD_MEMORY_PATTERNS.some(p => p.test(taskText));
+  const hasSkipKeyword = KEYWORD_SKIP_PATTERNS.some(p => p.test(taskText));
+  if (hasSkipKeyword && !hasMemoryKeyword) {
+    return { inject: false, method: "keyword_heuristic", latency_ms: Date.now() - start };
+  }
+  if (hasMemoryKeyword) {
+    return { inject: true, method: "keyword_heuristic", latency_ms: Date.now() - start };
+  }
+
+  // Tier 3: Ollama classifier (200ms timeout)
+  try {
+    const gate = await Promise.race([
+      callOllama(taskText),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("gate_timeout")), 200)
+      ),
+    ]);
+    return {
+      inject: gate.needs_memory,
+      method: "ollama_classifier",
+      latency_ms: Date.now() - start,
+    };
+  } catch {
+    // Tier 4: Timeout or error — default to inject (safe fallback)
+    return { inject: true, method: "timeout_default", latency_ms: Date.now() - start };
+  }
+}
+
+// --- CLI entry point (backward compatible) ---
+
 async function main() {
   const message = process.argv.slice(2).join(" ").trim();
 
@@ -152,6 +213,18 @@ async function main() {
       const continuationResults = await searchContinuation(message);
       if (continuationResults && !continuationResults.includes("No continuation context found")) {
         console.log(continuationResults);
+        process.exit(0);
+      }
+    }
+
+    // Wikilink fast-path: if message contains [[entity]], search directly without Ollama
+    const wikilinks = extractWikilinks(message);
+    if (wikilinks.length > 0) {
+      const wlKeywords = wikilinks.map(wl => wl.entity);
+      const results = await searchMemory(wlKeywords, true);
+      if (results && !results.includes("No results") && !results.includes("Found 0 results") && results.length >= 10) {
+        console.log(`[Memory Context — wikilink fast-path: ${wlKeywords.join(", ")}]`);
+        console.log(results);
         process.exit(0);
       }
     }
@@ -177,6 +250,55 @@ async function main() {
     // Output results for injection into context
     console.log(`[Memory Context — keywords: ${gate.keywords.join(", ")}]`);
     console.log(results);
+
+    // --- Inline fact extraction (fires after memory injection) ---
+    // Extract conversation context from conversation transcript for fact extraction
+    // First, try to get recent conversation messages from the workspace transcript
+    const INLINE_CAPTURE_SCRIPT = "/home/workspace/Skills/zo-memory-system/scripts/inline-capture.ts";
+    const WORKSPACES_DIR = "/home/.z/workspaces";
+
+    // Try to find the most recent workspace with conversation context
+    let conversationContext = "";
+    try {
+      const { readdirSync, readFileSync, statSync } = await import("fs");
+      const { join } = await import("path");
+      const conDirs = readdirSync(WORKSPACES_DIR).filter(d => d.startsWith("con_"));
+      // Find the most recently active conversation
+      let latestMtime = 0;
+      let latestDir = "";
+      for (const dir of conDirs) {
+        try {
+          const mtime = statSync(join(WORKSPACES_DIR, dir)).mtimeMs;
+          if (mtime > latestMtime) { latestMtime = mtime; latestDir = dir; }
+        } catch { /* skip inaccessible dirs */ }
+      }
+      // Read any transcript or message files in the latest conversation dir
+      if (latestDir) {
+        const recentFiles = readdirSync(join(WORKSPACES_DIR, latestDir)).filter(f =>
+          f.endsWith(".json") || f.endsWith(".md") || f.endsWith(".txt")
+        );
+        for (const f of recentFiles) {
+          try {
+            const content = readFileSync(join(WORKSPACES_DIR, latestDir, f), "utf-8").slice(0, 8000);
+            if (content.length > 200) { conversationContext = content; break; }
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* workspace read failed — skip context, use message only */ }
+
+    // Spawn inline-capture detached (survives parent exit)
+    const captureSource = `inline:chat/${gate.keywords.join("-")}`;
+    const captureArgs = conversationContext
+      ? ["bun", INLINE_CAPTURE_SCRIPT, "--message", message, "--context", conversationContext, "--source", captureSource]
+      : ["bun", INLINE_CAPTURE_SCRIPT, "--message", message, "--source", captureSource];
+
+    const proc = Bun.spawn(captureArgs, {
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    // Detach so subprocess outlives parent gate process
+    proc.unref();
+
     process.exit(0);
 
   } catch (err) {
@@ -185,4 +307,7 @@ async function main() {
   }
 }
 
-main();
+// Only run CLI when invoked directly (not imported as module)
+if (import.meta.main) {
+  main();
+}

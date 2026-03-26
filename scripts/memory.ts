@@ -22,6 +22,7 @@ import { randomUUID, createHash } from "crypto";
 import { join } from "path";
 import { readFileSync } from "fs";
 import { computeGraphBoost, findGraphNeighbors } from "./graph-boost";
+import { extractWikilinks, resolveWikilinkTargets, autoCorrectWikilinks, shouldExcludeFromWrapping, ENTITY_LIKE_PATTERN } from "./wikilink-utils";
 import {
   createEpisodeRecord,
   detectContinuation,
@@ -277,18 +278,42 @@ function cosineSimilarity(a: number[], b: number[]): number {
 }
 
 // --- Store with Embedding ---
-async function storeWithEmbedding(entry: Omit<MemoryEntry, "id" | "createdAt" | "expiresAt" | "lastAccessed">): Promise<MemoryEntry | null> {
+
+interface StoreOptions {
+  skipWikilinkEnforcement?: boolean;
+}
+
+async function storeWithEmbedding(
+  entry: Omit<MemoryEntry, "id" | "createdAt" | "expiresAt" | "lastAccessed">,
+  options?: StoreOptions
+): Promise<MemoryEntry | null> {
   const db = await initDb();
   const id = randomUUID();
   const now = Date.now();
   const nowSec = Math.floor(now / 1000);
-  
+
   const decayClass = entry.decayClass || "stable";
   const expiresAt = TTL_DEFAULTS[decayClass] ? nowSec + TTL_DEFAULTS[decayClass]! : null;
-  
+
+  // Wikilink auto-correction (default ON, opt-out via options.skipWikilinkEnforcement)
+  let storeValue = entry.value;
+  let storeMetadata = entry.metadata ? { ...entry.metadata } : {};
+  if (!options?.skipWikilinkEnforcement) {
+    const correction = autoCorrectWikilinks(storeValue, db, entry.entity);
+    if (correction) {
+      storeMetadata.original_value = correction.original_value;
+      storeValue = correction.corrected_value;
+      console.error(
+        `\x1b[36m[wikilink-autocorrect]\x1b[0m Wrapped ${correction.corrections_made.length} entity reference(s) in [[...]]: ` +
+        `${correction.corrections_made.map(c => c.entity).join(", ")} [tier: ${correction.confidence_tier}]`
+      );
+    }
+  }
+
   // Insert fact
+  const metadataStr = Object.keys(storeMetadata).length > 0 ? JSON.stringify(storeMetadata) : null;
   db.prepare(`
-    INSERT INTO facts (id, persona, entity, key, value, text, category, decay_class, 
+    INSERT INTO facts (id, persona, entity, key, value, text, category, decay_class,
                        importance, source, created_at, expires_at, last_accessed, confidence, metadata)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -296,8 +321,8 @@ async function storeWithEmbedding(entry: Omit<MemoryEntry, "id" | "createdAt" | 
     entry.persona,
     entry.entity,
     entry.key,
-    entry.value,
-    entry.text || `${entry.entity} ${entry.key || ""}: ${entry.value}`,
+    storeValue,
+    entry.text || `${entry.entity} ${entry.key || ""}: ${storeValue}`,
     entry.category,
     decayClass,
     entry.importance,
@@ -306,22 +331,37 @@ async function storeWithEmbedding(entry: Omit<MemoryEntry, "id" | "createdAt" | 
     expiresAt,
     nowSec,
     entry.confidence,
-    entry.metadata ? JSON.stringify(entry.metadata) : null
+    metadataStr
   );
-  
+
   // Generate and store embedding
-  const textToEmbed = entry.text || `${entry.entity} ${entry.key || ""}: ${entry.value}`;
+  const textToEmbed = entry.text || `${entry.entity} ${entry.key || ""}: ${storeValue}`;
   const embedding = await getEmbedding(textToEmbed);
-  
+
   if (embedding) {
     db.prepare(`
       INSERT INTO fact_embeddings (fact_id, embedding, model)
       VALUES (?, ?, ?)
     `).run(id, Buffer.from(new Float32Array(embedding).buffer), EMBEDDING_MODEL);
   }
-  
+
+  // Parse wikilinks from value and create fact_links edges
+  const wikilinks = extractWikilinks(storeValue);
+  if (wikilinks.length > 0) {
+    const resolved = resolveWikilinkTargets(db, wikilinks, {
+      sourcePersona: entry.persona,
+      sourceId: id,
+    });
+    for (const link of resolved) {
+      db.prepare(
+        "INSERT OR IGNORE INTO fact_links (source_id, target_id, relation, weight) VALUES (?, ?, 'wikilink', 1.0)"
+      ).run(id, link.targetId);
+    }
+  }
+
   return {
     ...entry,
+    value: storeValue,
     id,
     createdAt: now,
     expiresAt,
@@ -1037,6 +1077,90 @@ Keep the same general structure but adjust executors, timeouts, or add fallbacks
   }
 }
 
+// --- Auto-Procedure from Episodes ---
+async function autoCreateProcedureFromEpisodes(
+  entityPattern: string,
+  sinceDate?: string,
+  minSuccessCount: number = 2
+): Promise<Procedure | null> {
+  const db = await initDb();
+
+  const since = sinceDate ? parseRelativeTime(sinceDate) : Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
+
+  const episodes = db.prepare(`
+    SELECT e.id, e.summary, e.outcome, e.duration_ms, e.metadata, e.happened_at
+    FROM episodes e
+    JOIN episode_entities ee ON e.id = ee.episode_id
+    WHERE ee.entity LIKE ? AND e.outcome = 'success' AND e.happened_at >= ?
+    ORDER BY e.happened_at DESC
+  `).all(`%${entityPattern}%`, since) as Array<Record<string, unknown>>;
+
+  if (episodes.length < minSuccessCount) {
+    console.log(`Only ${episodes.length} successful episodes match "${entityPattern}" (need ${minSuccessCount}). Skipping.`);
+    return null;
+  }
+
+  const steps: ProcedureStep[] = [];
+  const executorCounts: Record<string, number> = {};
+
+  for (const ep of episodes) {
+    const meta = ep.metadata ? JSON.parse(ep.metadata as string) : {};
+    if (meta.executors) {
+      for (const exec of meta.executors as string[]) {
+        executorCounts[exec] = (executorCounts[exec] || 0) + 1;
+      }
+    }
+    if (meta.tasks && Array.isArray(meta.tasks)) {
+      for (const task of meta.tasks as Array<{ executor?: string; category?: string; durationMs?: number }>) {
+        if (task.executor && task.category) {
+          steps.push({
+            executor: task.executor,
+            taskPattern: task.category,
+            timeoutSeconds: task.durationMs ? Math.ceil(task.durationMs / 1000) * 2 : 300,
+          });
+        }
+      }
+    }
+  }
+
+  if (steps.length === 0) {
+    const topExecutors = Object.entries(executorCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+    for (const [exec] of topExecutors) {
+      steps.push({
+        executor: exec,
+        taskPattern: entityPattern,
+        timeoutSeconds: 300,
+        notes: `Inferred from ${executorCounts[exec]} successful episodes`,
+      });
+    }
+  }
+
+  if (steps.length === 0) {
+    console.log("Could not infer procedure steps from episode metadata.");
+    return null;
+  }
+
+  const deduped = steps.reduce<ProcedureStep[]>((acc, step) => {
+    if (!acc.find(s => s.executor === step.executor && s.taskPattern === step.taskPattern)) {
+      acc.push(step);
+    }
+    return acc;
+  }, []);
+
+  const name = `auto-${entityPattern.replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`;
+  const existing = await getProcedure(name);
+  if (existing) {
+    console.log(`Procedure "${name}" already exists (v${existing.version}). Use --evolve to update.`);
+    return existing;
+  }
+
+  const proc = await createProcedure({ name, version: 1, steps: deduped });
+  console.log(`Auto-created procedure: ${proc.name} v${proc.version} with ${deduped.length} steps from ${episodes.length} episodes`);
+  return proc;
+}
+
 // --- Stats ---
 async function stats(): Promise<void> {
   const db = await initDb();
@@ -1111,7 +1235,8 @@ Commands:
   index     Backfill embeddings for existing facts
   stats     Show memory statistics
   migrate   Run database migration (adds episodes + procedures tables)
-  episodes  List/query episodic memory
+  episodes  List/query episodic memory (--create to add)
+  procedures  List/manage workflow procedures (--create, --show, --evolve, --auto, --feedback)
   trends    Show velocity trends for an entity
 
 Store options:
@@ -1130,11 +1255,26 @@ Search options:
   --window <days>      Continuation lookback window in days (default: 14)
 
 Episodes options:
-  --entity <name>      Filter by entity
-  --outcome <type>     Filter: success|failure|resolved|ongoing
+  --create             Create a new episode
+  --summary <text>     Episode summary (required for --create)
+  --outcome <type>     Filter or set: success|failure|resolved|ongoing
+  --entities <csv>     Comma-separated entity list (for --create)
+  --duration <ms>      Duration in milliseconds (for --create)
+  --entity <name>      Filter by entity (for listing)
   --since <time>       Since: "7 days ago", "2026-03-01", "last week"
   --until <time>       Until: same formats as --since
   --limit <n>          Max results (default: 20)
+
+Procedures options:
+  --create             Create a new procedure
+  --name <name>        Procedure name (required for --create)
+  --steps <json>       Steps as JSON array or path to JSON file (required for --create)
+  --version <n>        Version number (default: 1)
+  --show <name>        Show procedure details
+  --evolve <name>      Evolve a procedure via Ollama analysis
+  --auto <pattern>     Auto-create procedure from successful episodes matching entity pattern
+  --feedback <name>    Record feedback (requires --success or --failure)
+  --min-success <n>    Min successful episodes for --auto (default: 2)
 
 Open loop options:
   --status <state>     open|resolved|stale|superseded
@@ -1148,6 +1288,9 @@ Examples:
   bun memory.ts hybrid "router password"
   bun memory.ts migrate
   bun memory.ts episodes --entity "swarm.ffb" --since "7 days ago"
+  bun memory.ts episodes --create --summary "Fixed auth bug" --outcome success --entities "auth,security"
+  bun memory.ts procedures --create --name "deploy-flow" --steps '[{"executor":"claude-code","taskPattern":"build","timeoutSeconds":300}]'
+  bun memory.ts procedures --auto "swarm" --since "7 days ago"
   bun memory.ts stats
 `);
 }
@@ -1172,6 +1315,8 @@ async function main() {
         flags.hyde = "false";
       } else if (args[i] === "--no-graph") {
         flags.graph = "false";
+      } else if (args[i] === "--create" || args[i] === "--list" || args[i] === "--success" || args[i] === "--failure" || args[i] === "--dry-run") {
+        flags[args[i].slice(2)] = "true";
       } else {
         flags[args[i].slice(2)] = args[i + 1] || "";
         i++;
@@ -1328,6 +1473,28 @@ async function main() {
     }
     
     case "episodes": {
+      if (flags.create !== undefined) {
+        if (!flags.summary) {
+          console.error("Error: --summary is required for --create");
+          process.exit(1);
+        }
+        const outcome = (flags.outcome as Outcome) || "success";
+        const entities = flags.entities ? flags.entities.split(",").map((e: string) => e.trim()) : [];
+        const durationMs = flags.duration ? parseInt(flags.duration) : undefined;
+        const ep = await createEpisode({
+          summary: flags.summary,
+          outcome,
+          happenedAt: Math.floor(Date.now() / 1000),
+          durationMs,
+          entities,
+          metadata: flags.metadata ? JSON.parse(flags.metadata) : undefined,
+        });
+        console.log(`Created episode: ${ep.id}`);
+        console.log(`  outcome: ${ep.outcome}`);
+        console.log(`  summary: ${ep.summary}`);
+        if (entities.length > 0) console.log(`  entities: ${entities.join(", ")}`);
+        break;
+      }
       const episodes = await findEpisodes({
         entity: flags.entity,
         outcome: flags.outcome as Outcome | undefined,
@@ -1385,7 +1552,38 @@ async function main() {
     }
     
     case "procedures": {
-      if (flags.list !== undefined || (!flags.show && !flags.evolve && !flags.feedback)) {
+      if (flags.create !== undefined) {
+        if (!flags.name) {
+          console.error("Error: --name is required for --create");
+          process.exit(1);
+        }
+        if (!flags.steps) {
+          console.error("Error: --steps is required (JSON array or path to JSON file)");
+          process.exit(1);
+        }
+        let steps: ProcedureStep[];
+        try {
+          if (flags.steps.startsWith("[")) {
+            steps = JSON.parse(flags.steps);
+          } else {
+            steps = JSON.parse(readFileSync(flags.steps, "utf-8"));
+          }
+        } catch (e) {
+          console.error(`Error parsing steps: ${e}`);
+          process.exit(1);
+        }
+        const version = parseInt(flags.version) || 1;
+        const proc = await createProcedure({ name: flags.name, version, steps });
+        console.log(`Created procedure: ${proc.id}`);
+        console.log(`  name: ${proc.name} v${proc.version}`);
+        console.log(`  steps: ${proc.steps.length}`);
+        for (let i = 0; i < proc.steps.length; i++) {
+          const s = proc.steps[i];
+          console.log(`    ${i + 1}. [${s.executor}] ${s.taskPattern} (${s.timeoutSeconds}s)`);
+        }
+        break;
+      }
+      if (flags.list !== undefined || (!flags.show && !flags.evolve && !flags.feedback && !flags.auto)) {
         const procs = await listProcedures();
         if (procs.length === 0) {
           console.log("No procedures found.");
@@ -1418,6 +1616,12 @@ async function main() {
           if (s.fallbackExecutor) console.log(`     fallback: ${s.fallbackExecutor}`);
           if (s.notes) console.log(`     note: ${s.notes}`);
         }
+      } else if (flags.auto) {
+        await autoCreateProcedureFromEpisodes(
+          flags.auto,
+          flags.since,
+          parseInt(flags["min-success"]) || 2
+        );
       } else if (flags.evolve) {
         await evolveProcedure(flags.evolve);
       } else if (flags.feedback) {

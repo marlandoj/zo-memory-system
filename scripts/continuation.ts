@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
 import { randomUUID } from "crypto";
+import { buildAdjacencyList, findArticulationPoints, isArticulationPoint, getArticulationPointDetails } from "./tarjan";
 
 type OpenLoopStatus = "open" | "resolved" | "stale" | "superseded";
 type OpenLoopKind = "task" | "bug" | "incident" | "approval" | "commitment" | "other";
@@ -41,6 +42,15 @@ export interface OpenLoopRecord extends OpenLoopInput {
   createdAt: number;
   updatedAt: number;
   resolvedAt?: number | null;
+  isArticulationPoint?: boolean; // NEW: Protected from decay if true
+}
+
+export interface ArticulationPointCheck {
+  loopId: string;
+  isProtected: boolean;
+  reason: string;
+  articulationFactIds: string[];
+  bridges: number;
 }
 
 export interface ContinuationDetection {
@@ -126,6 +136,283 @@ function inferEntity(text: string): string | null {
 function recencyBoost(unixSeconds: number, windowDays: number): number {
   const ageDays = Math.max(0, (Date.now() / 1000 - unixSeconds) / 86400);
   return Math.max(0, 1 - ageDays / windowDays);
+}
+
+/**
+ * Check if an open loop is connected to articulation points in the knowledge graph
+ * Returns details about why the loop should be protected from decay
+ */
+export function checkArticulationPointsForOpenLoop(
+  db: Database,
+  loop: OpenLoopRecord | { entity?: string | null; title: string; summary: string }
+): ArticulationPointCheck {
+  try {
+    const adj = buildAdjacencyList(db);
+
+    if (adj.size === 0) {
+      return {
+        loopId: "unknown",
+        isProtected: false,
+        reason: "No graph connections found",
+        articulationFactIds: [],
+        bridges: 0,
+      };
+    }
+
+    // Find facts related to this open loop
+    const relatedFactIds: string[] = [];
+
+    // If loop has an entity, find facts for that entity
+    if (loop.entity) {
+      const entityFacts = db.prepare("SELECT id FROM facts WHERE entity = ?").all(loop.entity) as Array<{ id: string }>;
+      relatedFactIds.push(...entityFacts.map(f => f.id));
+    }
+
+    // Also search for facts that might be semantically related
+    const keywords = tokenize(`${loop.title} ${loop.summary}`).slice(0, 5);
+    if (keywords.length > 0) {
+      const ftsQuery = keywords.map(k => `"${k}"`).join(" OR ");
+      const ftsFacts = db.prepare(`
+        SELECT f.id FROM facts f
+        JOIN facts_fts fts ON fts.rowid = f.rowid
+        WHERE facts_fts MATCH ?
+        LIMIT 10
+      `).all(ftsQuery) as Array<{ id: string }>;
+      relatedFactIds.push(...ftsFacts.map(f => f.id));
+    }
+
+    // Deduplicate
+    const uniqueFactIds = Array.from(new Set(relatedFactIds));
+
+    // Check which of these are articulation points
+    const articulationPoints = findArticulationPoints(adj);
+    const matchingArticulationPoints = uniqueFactIds.filter(id => articulationPoints.has(id));
+
+    if (matchingArticulationPoints.length === 0) {
+      return {
+        loopId: (loop as OpenLoopRecord).id || "unknown",
+        isProtected: false,
+        reason: "No articulation points connected to this open loop",
+        articulationFactIds: [],
+        bridges: 0,
+      };
+    }
+
+    // Calculate total bridges
+    let totalBridges = 0;
+    for (const factId of matchingArticulationPoints) {
+      // Count would-be disconnected components
+      const neighbors = adj.get(factId) || new Set();
+      if (neighbors.size > 1) {
+        totalBridges += neighbors.size - 1; // Approximation
+      }
+    }
+
+    return {
+      loopId: (loop as OpenLoopRecord).id || "unknown",
+      isProtected: true,
+      reason: `Connected to ${matchingArticulationPoints.length} articulation point(s) — removing would disconnect knowledge graph`,
+      articulationFactIds: matchingArticulationPoints,
+      bridges: totalBridges,
+    };
+  } catch (error) {
+    // If anything fails, don't block the operation
+    return {
+      loopId: (loop as OpenLoopRecord).id || "unknown",
+      isProtected: false,
+      reason: `Error checking articulation points: ${error}`,
+      articulationFactIds: [],
+      bridges: 0,
+    };
+  }
+}
+
+/**
+ * Get all open loops that should be protected from decay due to being articulation points
+ */
+export function getCriticalOpenLoops(db: Database): Array<OpenLoopRecord & { protectionReason: string }> {
+  ensureContinuationSchema(db);
+
+  const openLoops = db.prepare(`
+    SELECT * FROM open_loops WHERE status IN ('open', 'stale')
+  `).all() as Array<Record<string, unknown>>;
+
+  const criticalLoops: Array<OpenLoopRecord & { protectionReason: string }> = [];
+
+  for (const row of openLoops) {
+    const loop: OpenLoopRecord = {
+      id: row.id as string,
+      persona: row.persona as string,
+      title: row.title as string,
+      summary: row.summary as string,
+      kind: row.kind as OpenLoopKind,
+      status: row.status as OpenLoopStatus,
+      priority: row.priority as number,
+      entity: row.entity as string | null,
+      source: row.source as string | undefined,
+      relatedEpisodeId: row.related_episode_id as string | null | undefined,
+      metadata: row.metadata ? JSON.parse(row.metadata as string) : undefined,
+      fingerprint: row.fingerprint as string,
+      createdAt: row.created_at as number,
+      updatedAt: row.updated_at as number,
+      resolvedAt: row.resolved_at as number | null | undefined,
+    };
+
+    const check = checkArticulationPointsForOpenLoop(db, loop);
+
+    if (check.isProtected) {
+      criticalLoops.push({
+        ...loop,
+        protectionReason: check.reason,
+      });
+    }
+  }
+
+  return criticalLoops;
+}
+
+/**
+ * Protect articulation point loops from being marked as stale
+ * Should be called during decay operations
+ */
+export function protectArticulationPointLoops(db: Database): {
+  protected: number;
+  unprotected: number;
+  details: Array<{ loopId: string; title: string; reason: string }>;
+} {
+  ensureContinuationSchema(db);
+
+  const staleLoops = db.prepare(`
+    SELECT * FROM open_loops WHERE status = 'stale'
+  `).all() as Array<Record<string, unknown>>;
+
+  let protected_ = 0;
+  let unprotected = 0;
+  const details: Array<{ loopId: string; title: string; reason: string }> = [];
+
+  for (const row of staleLoops) {
+    const loop: OpenLoopRecord = {
+      id: row.id as string,
+      persona: row.persona as string,
+      title: row.title as string,
+      summary: row.summary as string,
+      kind: row.kind as OpenLoopKind,
+      status: row.status as OpenLoopStatus,
+      priority: row.priority as number,
+      entity: row.entity as string | null,
+      source: row.source as string | undefined,
+      relatedEpisodeId: row.related_episode_id as string | null | undefined,
+      metadata: row.metadata ? JSON.parse(row.metadata as string) : undefined,
+      fingerprint: row.fingerprint as string,
+      createdAt: row.created_at as number,
+      updatedAt: row.updated_at as number,
+      resolvedAt: row.resolved_at as number | null | undefined,
+    };
+
+    const check = checkArticulationPointsForOpenLoop(db, loop);
+
+    if (check.isProtected) {
+      // Revert to 'open' status — this loop is critical
+      db.prepare(`
+        UPDATE open_loops
+        SET status = 'open', updated_at = ?
+        WHERE id = ?
+      `).run(Math.floor(Date.now() / 1000), loop.id);
+
+      protected_++;
+      details.push({ loopId: loop.id, title: loop.title, reason: check.reason });
+    } else {
+      unprotected++;
+    }
+  }
+
+  return { protected: protected_, unprotected, details };
+}
+
+/**
+ * Auto-resolve open loops that have been stale for 30+ days AND are not
+ * connected to articulation points (not critical to the knowledge graph).
+ *
+ * Living projects are detected by checking if the loop's entity matches
+ * any entity that has facts created in the last 30 days.
+ *
+ * Resolved loops get a metadata note explaining why.
+ */
+export function autoResolveStaleLoops(
+  db: Database,
+  staleDays: number = 30,
+  livingDays: number = 30
+): {
+  resolved: number;
+  skipped: number;
+  details: Array<{ loopId: string; title: string; reason: string }>;
+} {
+  ensureContinuationSchema(db);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const staleThreshold = nowSec - staleDays * 86400;
+
+  // Find entities that have had fact activity in the last `livingDays` days
+  // These are "living" projects — loops pointing to them should NOT be auto-resolved
+  const livingEntities = new Set<string | null>();
+  const livingThreshold = nowSec - livingDays * 86400;
+  const livingEntityRows = db.prepare(`
+    SELECT DISTINCT entity FROM facts
+    WHERE entity IS NOT NULL AND created_at > ?
+  `).all(livingThreshold) as Array<{ entity: string }>;
+  for (const row of livingEntityRows) {
+    livingEntities.add(row.entity);
+  }
+
+  // Also protect entities that have open loops with recent activity
+  const recentLoopEntities = db.prepare(`
+    SELECT DISTINCT entity FROM open_loops
+    WHERE entity IS NOT NULL AND status = 'open' AND updated_at > ?
+  `).all(staleThreshold) as Array<{ entity: string }>;
+  for (const row of recentLoopEntities) {
+    livingEntities.add(row.entity);
+  }
+
+  // Fetch stale loops
+  const staleLoops = db.prepare(`
+    SELECT id, title, entity FROM open_loops
+    WHERE status = 'stale' AND updated_at < ?
+  `).all(staleThreshold) as Array<{ id: string; title: string; entity: string | null }>;
+
+  let resolved = 0;
+  let skipped = 0;
+  const details: Array<{ loopId: string; title: string; reason: string }> = [];
+
+  for (const loop of staleLoops) {
+    // Skip if entity is a living project
+    if (loop.entity && livingEntities.has(loop.entity)) {
+      skipped++;
+      continue;
+    }
+
+    // Check articulation point protection
+    const check = checkArticulationPointsForOpenLoop(db, loop);
+    if (check.isProtected) {
+      skipped++;
+      continue;
+    }
+
+    // Auto-resolve
+    const note = `Auto-resolved by decay agent: no activity for ${staleDays}+ days and no living project connection.`;
+    db.prepare(`
+      UPDATE open_loops
+      SET status = 'resolved',
+          resolved_at = ?,
+          updated_at = ?,
+          metadata = json_set(COALESCE(metadata, '{}'), '$.auto_resolve_note', ?)
+      WHERE id = ?
+    `).run(nowSec, nowSec, note, loop.id);
+
+    resolved++;
+    details.push({ loopId: loop.id, title: loop.title, reason: note });
+  }
+
+  return { resolved, skipped, details };
 }
 
 export function ensureContinuationSchema(db: Database): void {

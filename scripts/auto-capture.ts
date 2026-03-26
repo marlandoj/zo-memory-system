@@ -23,6 +23,7 @@ import {
   resolveMatchingOpenLoops,
   upsertOpenLoop,
 } from "./continuation";
+import { extractWikilinks, resolveWikilinkTargets, autoCorrectWikilinks, shouldExcludeFromWrapping, ENTITY_LIKE_PATTERN } from "./wikilink-utils";
 
 // --- Configuration ---
 const DB_PATH = process.env.ZO_MEMORY_DB || "/home/workspace/.zo/memory/shared-facts.db";
@@ -125,6 +126,7 @@ Rules:
 - Assign confidence: 1.0 for explicit statements, 0.8 for strong implications, 0.6 for inferences
 - Include source_quote: the exact text from the transcript that supports this fact
 - entity format: "category.subject" (e.g., "project.ffb-site", "user", "decision.hosting", "system.ollama")
+- WIKILINKS: Annotate entity references in the "value" field using [[entity]] syntax. This creates graph edges in the knowledge base. Use [[category.subject]] for known entities and [[new.entity]] for new ones. Example: "Switched [[project.ffb]] hosting from Vercel to [[service.aws-s3]]"
 
 Output ONLY a valid JSON array of objects with these fields: entity, key, value, category, decay_class, confidence, source_quote
 If nothing worth extracting, return [].
@@ -232,6 +234,52 @@ function checkExisting(db: Database, entity: string, key: string, value: string)
   return { isDuplicate: false, contradicts: existing[0].id };
 }
 
+// --- Wikilink Validation Post-Pass ---
+
+function validateWikilinks(facts: CapturedFact[], db: Database): CapturedFact[] {
+  // Build entity set from the batch for cross-fact detection
+  const batchEntities = new Set(facts.map(f => f.entity.toLowerCase()));
+
+  return facts.map(fact => {
+    let value = fact.value;
+
+    // 1. Auto-correct using shared wikilink-utils (checks DB for known entities)
+    const correction = autoCorrectWikilinks(value, db, fact.entity);
+    if (correction) {
+      value = correction.corrected_value;
+    }
+
+    // 2. Cross-fact entity detection: if entity of fact A appears bare in fact B's value, wrap it
+    ENTITY_LIKE_PATTERN.lastIndex = 0;
+    const existingLinks = extractWikilinks(value);
+    const linkedSet = new Set(existingLinks.map(w => w.entity.toLowerCase()));
+
+    for (const otherEntity of batchEntities) {
+      if (otherEntity === fact.entity.toLowerCase()) continue;
+      if (linkedSet.has(otherEntity)) continue;
+      if (shouldExcludeFromWrapping(otherEntity)) continue;
+
+      // Check if this entity appears as a bare word in the value
+      const bareRe = new RegExp(`\\b${otherEntity.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
+      if (bareRe.test(value)) {
+        // Make sure it's not already inside [[ ]]
+        value = value.replace(bareRe, (match, offset) => {
+          const before = value.slice(0, offset);
+          const openBrackets = (before.match(/\[\[/g) || []).length;
+          const closeBrackets = (before.match(/\]\]/g) || []).length;
+          if (openBrackets > closeBrackets) return match; // inside wikilink
+          return `[[${match}]]`;
+        });
+      }
+    }
+
+    if (value !== fact.value) {
+      return { ...fact, value };
+    }
+    return fact;
+  });
+}
+
 // --- Core Pipeline ---
 
 async function runCapture(
@@ -274,6 +322,9 @@ async function runCapture(
       heuristicOnly = true;
     }
   }
+
+  // Wikilink validation post-pass: wrap bare entities in extracted facts before store
+  candidates = validateWikilinks(candidates, db);
 
   const stored: CapturedFact[] = [];
   const skipped: Array<{ fact: CapturedFact; reason: string }> = [];
@@ -347,6 +398,21 @@ async function runCapture(
         .run(id, contradicts);
       db.prepare("UPDATE facts SET confidence = confidence * 0.5 WHERE id = ?").run(contradicts);
       contradictions++;
+    }
+
+    // Parse wikilinks from value and create graph edges
+    const wikilinks = extractWikilinks(fact.value);
+    if (wikilinks.length > 0) {
+      const resolved = resolveWikilinkTargets(db, wikilinks, {
+        sourcePersona: options.persona,
+        sourceId: id,
+      });
+      for (const link of resolved) {
+        db.prepare(
+          "INSERT OR IGNORE INTO fact_links (source_id, target_id, relation, weight) VALUES (?, ?, 'wikilink', 1.0)"
+        ).run(id, link.targetId);
+        linksCreated++;
+      }
     }
 
     storedIds.push(id);

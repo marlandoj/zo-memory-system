@@ -518,7 +518,7 @@ function checkAuth(req: Request): boolean {
 // --- Bun HTTP server ---
 const server = Bun.serve({
   port: PORT,
-  hostname: "0.0.0.0",
+  hostname: "127.0.0.1",  // Changed from "0.0.0.0" — localhost only
   idleTimeout: 0, // Disable timeout for long-lived SSE connections
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
