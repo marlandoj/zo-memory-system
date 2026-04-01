@@ -1,3 +1,7 @@
+> **⚠️ DEPRECATED** — This repository has been archived. All code has been migrated to the [Zouroboros monorepo](https://github.com/marlandoj/Zouroboros) under `packages/memory/`. Please open issues and PRs there.
+
+---
+
 # Zouroboros Memory System
 
 > Give your Zo Computer personas persistent memory with semantic understanding, a knowledge graph, and automatic fact extraction. All local, no API costs.
